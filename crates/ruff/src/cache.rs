@@ -1,1097 +1,568 @@
-use std::fmt::Debug;
+//! Ruff's per-file cache: `ruff check` keeps the files it found without diagnostics, and
+//! `ruff format` the files it found formatted, so that a later run skips them.
+//!
+//! Invariants:
+//! - A run with the cache prints, exits and writes what the same run without it would, apart from
+//!   warnings logged while checking a file found clean (such as an invalid `# noqa` directive),
+//!   which, as before, are printed only by the run that checks it.
+//! - A file's result is used only under a key covering the build, the command, the settings the
+//!   file is checked or formatted with, its permissions (which `ruff check`'s `EXE` rules read),
+//!   and everything else the result depends on besides the file's path and content (for
+//!   `ruff check`, its package root).
+//! - A file's `stat` is trusted only outside its racy window; a file whose `stat` changed is read
+//!   and keeps its result if its content didn't change.
+//! - The cache never changes an answer by failing: anything unreadable is a miss, and anything
+//!   unwritable is skipped.
+//!
+//! Each cache directory keeps, under the running version:
+//! - `check/<package>` and `format/<package>`: the results of each package's files, by path
+//!   relative to the package root;
+//! - `store`: every result by key, path and content, shared by all of them;
+//! - `builds`: the digests of the executables that ran.
+
 use std::fs;
-use std::hash::Hasher;
+use std::hash::{Hash, Hasher};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{Duration, SystemTime};
+use std::sync::Arc;
+use std::time::Duration;
 
-use anyhow::{Context, Result};
-use filetime::FileTime;
+use anyhow::Result;
 use itertools::Itertools;
 use log::{debug, error};
-use rayon::iter::ParallelIterator;
-use rayon::iter::{IntoParallelIterator, ParallelBridge};
+use rayon::prelude::*;
 use rustc_hash::FxHashMap;
-use tempfile::NamedTempFile;
+use serde::de::DeserializeOwned;
+use serde::{Deserialize, Serialize};
 
 use ruff_cache::{CacheKey, CacheKeyHasher};
+use ruff_file_cache::{BuildId, Cache, CacheDir, Digest, Retention, Stat, Timestamp};
+use ruff_linter::VERSION;
 use ruff_linter::package::PackageRoot;
-use ruff_linter::{VERSION, warn_user};
-use ruff_macros::CacheKey;
+use ruff_linter::source_kind::{SourceError, SourceKind};
+use ruff_python_ast::SourceType;
 use ruff_workspace::Settings;
 use ruff_workspace::resolver::Resolver;
 
-/// [`Path`] that is relative to the package root in [`PackageCache`].
-pub(crate) type RelativePath = Path;
-/// [`PathBuf`] that is relative to the package root in [`PackageCache`].
-pub(crate) type RelativePathBuf = PathBuf;
+/// How long a file's result is kept when no run looks it up: runs given some of a package's
+/// files (as pre-commit hooks and editors do) keep the results of the others.
+const KEEP_UNVISITED: Duration = Duration::from_hours(720); // 30 days.
 
-#[derive(CacheKey)]
-pub(crate) struct FileCacheKey {
-    /// Timestamp when the file was last modified before the (cached) check.
-    file_last_modified: FileTime,
-    /// Permissions of the file before the (cached) check.
-    file_permissions_mode: u32,
+/// What a command keeps for a file.
+pub(crate) trait Verdict: Clone + Serialize + DeserializeOwned + Send + Sync {
+    /// The command's name: its results are kept apart from other commands'.
+    const COMMAND: &'static str;
 }
 
-impl FileCacheKey {
-    pub(crate) fn from_path(path: &Path) -> io::Result<FileCacheKey> {
-        // Construct a cache key for the file
-        let metadata = path.metadata()?;
+/// `ruff check` found no diagnostics in the file.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub(crate) struct Clean;
 
-        #[cfg(unix)]
-        let permissions = {
-            use std::os::unix::fs::PermissionsExt;
-            metadata.permissions().mode()
-        };
-        #[cfg(windows)]
-        let permissions: u32 = metadata.permissions().readonly().into();
-
-        Ok(FileCacheKey {
-            file_last_modified: FileTime::from_last_modification_time(&metadata),
-            file_permissions_mode: permissions,
-        })
-    }
+impl Verdict for Clean {
+    const COMMAND: &'static str = "check";
 }
 
-/// Cache.
-///
-/// `Cache` holds everything required to display the diagnostics for a single
-/// package. The on-disk representation is represented in [`PackageCache`] (and
-/// related) types.
-///
-/// This type manages the cache file, reading it from disk and writing it back
-/// to disk (if required).
-#[derive(Debug)]
-pub(crate) struct Cache {
-    /// Location of the cache.
-    path: PathBuf,
-    /// Package cache read from disk.
-    package: PackageCache,
-    /// Changes made compared to the (current) `package`.
-    ///
-    /// Files that are linted, but are not in `package.files` or are in
-    /// `package.files` but are outdated. This gets merged with `package.files`
-    /// when the cache is written back to disk in [`Cache::store`].
-    changes: Mutex<Vec<Change>>,
-    /// The "current" timestamp used as cache for the updates of
-    /// [`FileCache::last_seen`]
-    #[expect(clippy::struct_field_names)]
-    last_seen_cache: u64,
+/// `ruff format` found the file formatted.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub(crate) struct Formatted;
+
+impl Verdict for Formatted {
+    const COMMAND: &'static str = "format";
 }
 
-impl Cache {
-    /// Open or create a new cache.
-    ///
-    /// `package_root` is the path to root of the package that is contained
-    /// within this cache and must be canonicalized (to avoid considering `./`
-    /// and `../project` being different).
-    ///
-    /// Finally `settings` is used to ensure we don't open a cache for different
-    /// settings. It also defines the directory where to store the cache.
-    fn open(package_root: PathBuf, settings: &Settings) -> Self {
-        debug_assert!(package_root.is_absolute(), "package root not canonicalized");
+/// A cache directory a run opened, and the build that runs.
+#[derive(Clone)]
+struct OpenDir {
+    /// `<cache-dir>/<version>`.
+    dir: Arc<CacheDir>,
+    /// The running build, as remembered in `dir`.
+    build: BuildId,
+}
 
-        let key = format!("{}", cache_key(&package_root, settings));
-        let path = PathBuf::from_iter([&settings.cache_dir, Path::new(VERSION), Path::new(&key)]);
-
-        let serialized = match fs::read(&path) {
-            Ok(serialized) => serialized,
-            Err(err) if err.kind() == io::ErrorKind::NotFound => {
-                // No cache exist yet, return an empty cache.
-                return Cache::empty(path, package_root);
-            }
-            Err(err) => {
-                warn_user!("Failed to open cache file `{}`: {err}", path.display());
-                return Cache::empty(path, package_root);
-            }
-        };
-
-        let mut package =
-            match rkyv::access::<ArchivedPackageCache, rkyv::rancor::Error>(&serialized)
-                .and_then(rkyv::deserialize::<PackageCache, rkyv::rancor::Error>)
-            {
-                Ok(package) => package,
-                Err(err) => {
-                    warn_user!("Failed parse cache file `{}`: {err}", path.display());
-                    return Cache::empty(path, package_root);
-                }
-            };
-
-        // Sanity check.
-        if package.package_root != package_root {
-            warn_user!(
-                "Different package root in cache: expected `{}`, got `{}`",
-                package_root.display(),
-                package.package_root.display(),
+impl OpenDir {
+    /// Opens the cache directory `cache_dir`, initializing it. Returns `None` if it can't be
+    /// created or the running build can't be identified: the run is then uncached.
+    fn open(cache_dir: &Path) -> Option<Self> {
+        if let Err(err) = Self::init(cache_dir) {
+            error!(
+                "Failed to initialize cache at {}: {err:?}",
+                cache_dir.display()
             );
-            package.files.clear();
-        }
-        Cache::new(path, package)
-    }
-
-    /// Create an empty `Cache`.
-    fn empty(path: PathBuf, package_root: PathBuf) -> Self {
-        let package = PackageCache {
-            package_root,
-            files: FxHashMap::default(),
-        };
-        Cache::new(path, package)
-    }
-
-    #[expect(clippy::cast_possible_truncation)]
-    fn new(path: PathBuf, package: PackageCache) -> Self {
-        Cache {
-            path,
-            package,
-            changes: Mutex::new(Vec::new()),
-            // SAFETY: this will be truncated to the year ~2554 (so don't use
-            // this code after that!).
-            last_seen_cache: SystemTime::UNIX_EPOCH.elapsed().unwrap().as_millis() as u64,
-        }
-    }
-
-    /// Applies the pending changes and persists the cache to disk, if it has been changed.
-    fn persist(mut self) -> Result<()> {
-        if !self.save() {
-            // No changes made, no need to write the same cache file back to
-            // disk.
-            return Ok(());
-        }
-
-        // Write the cache to a temporary file first and then rename it for an "atomic" write.
-        // Protects against data loss if the process is killed during the write and races between different ruff
-        // processes, resulting in a corrupted cache file. https://github.com/astral-sh/ruff/issues/8147#issuecomment-1943345964
-        let mut temp_file = tempfile_in(self.path.parent().expect("Write path must have a parent"))
-            .context("Failed to create temporary file")?;
-
-        // Serialize to in-memory buffer because hyperfine benchmark showed that it's faster than
-        // using a `BufWriter` and our cache files are small enough that streaming isn't necessary.
-        let serialized = rkyv::to_bytes::<rkyv::rancor::Error>(&self.package)
-            .context("Failed to serialize cache data")?;
-        temp_file
-            .write_all(&serialized)
-            .context("Failed to write serialized cache to temporary file.")?;
-
-        if let Err(err) = temp_file.persist(&self.path) {
-            // On Windows, writing to the cache file can fail if the file is still open (e.g., if
-            // the user is running Ruff from multiple processes over the same directory).
-            if cfg!(windows) && err.error.kind() == io::ErrorKind::PermissionDenied {
-                warn_user!(
-                    "Failed to write cache file `{}`: {}",
-                    self.path.display(),
-                    err.error
-                );
-            } else {
-                return Err(err).with_context(|| {
-                    format!(
-                        "Failed to rename temporary cache file to {}",
-                        self.path.display()
-                    )
-                });
-            }
-        }
-
-        Ok(())
-    }
-
-    /// Applies the pending changes without storing the cache to disk.
-    #[expect(clippy::cast_possible_truncation)]
-    fn save(&mut self) -> bool {
-        /// Maximum duration for which we keep a file in cache that hasn't been seen.
-        const MAX_LAST_SEEN: Duration = Duration::from_hours(720); // 30 days.
-
-        let changes = std::mem::take(self.changes.get_mut().unwrap());
-        if changes.is_empty() {
-            return false;
-        }
-
-        // Remove cached files that we haven't seen in a while.
-        let now = self.last_seen_cache;
-        self.package.files.retain(|_, file| {
-            // SAFETY: this will be truncated to the year ~2554.
-            (now - *file.last_seen.get_mut()) <= MAX_LAST_SEEN.as_millis() as u64
-        });
-
-        // Apply any changes made and keep track of when we last saw files.
-        for change in changes {
-            let entry = self
-                .package
-                .files
-                .entry(change.path)
-                .and_modify(|existing| {
-                    if existing.key != change.new_key {
-                        // Reset the data if the key change.
-                        existing.data = FileCacheData::default();
-                    }
-
-                    existing.key = change.new_key;
-                    existing
-                        .last_seen
-                        .store(self.last_seen_cache, Ordering::Relaxed);
-                })
-                .or_insert_with(|| FileCache {
-                    key: change.new_key,
-                    last_seen: AtomicU64::new(self.last_seen_cache),
-                    data: FileCacheData::default(),
-                });
-
-            change.new_data.apply(&mut entry.data);
-        }
-
-        true
-    }
-
-    /// Returns the relative path based on `path` and the package root.
-    ///
-    /// Returns `None` if `path` is not within the package.
-    pub(crate) fn relative_path<'a>(&self, path: &'a Path) -> Option<&'a RelativePath> {
-        path.strip_prefix(&self.package.package_root).ok()
-    }
-
-    /// Get the cached results for a single file at relative `path`. This
-    /// uses `key` to determine if the results are still accurate.
-    /// (i.e. if the file hasn't been modified since the cached run).
-    ///
-    /// This returns `None` if `key` differs from the cached key or if the
-    /// cache doesn't contain results for the file.
-    pub(crate) fn get(&self, path: &RelativePath, key: &FileCacheKey) -> Option<&FileCache> {
-        let file = self.package.files.get(path)?;
-
-        let mut hasher = CacheKeyHasher::new();
-        key.cache_key(&mut hasher);
-
-        // Make sure the file hasn't changed since the cached run.
-        if file.key != hasher.finish() {
             return None;
         }
-
-        file.last_seen.store(self.last_seen_cache, Ordering::SeqCst);
-
-        Some(file)
+        let dir = CacheDir::open(&cache_dir.join(VERSION))?;
+        let build = BuildId::current(&dir, "builds")?;
+        Some(Self {
+            dir: Arc::new(dir),
+            build,
+        })
     }
 
-    pub(crate) fn is_formatted(&self, path: &RelativePath, key: &FileCacheKey) -> bool {
-        self.get(path, key)
-            .is_some_and(|entry| entry.data.formatted)
-    }
-
-    /// Add or update a file cache at `path` relative to the package root.
-    fn update(&self, path: RelativePathBuf, key: &FileCacheKey, data: ChangeData) {
-        let mut hasher = CacheKeyHasher::new();
-        key.cache_key(&mut hasher);
-
-        self.changes.lock().unwrap().push(Change {
-            path,
-            new_key: hasher.finish(),
-            new_data: data,
-        });
-    }
-
-    pub(crate) fn set_linted(&self, path: RelativePathBuf, key: &FileCacheKey, yes: bool) {
-        self.update(path, key, ChangeData::Linted(yes));
-    }
-
-    pub(crate) fn set_formatted(&self, path: RelativePathBuf, key: &FileCacheKey) {
-        self.update(path, key, ChangeData::Formatted);
-    }
-}
-
-/// Return a [`NamedTempFile`] in the specified directory.
-///
-/// Sets the permissions of the temporary file to `0o666`, to match the non-temporary file
-/// default. ([`NamedTempFile`] defaults to `0o600`.)
-#[cfg(unix)]
-fn tempfile_in(path: &Path) -> io::Result<NamedTempFile> {
-    use std::os::unix::fs::PermissionsExt;
-
-    tempfile::Builder::new()
-        .permissions(fs::Permissions::from_mode(0o666))
-        .tempfile_in(path)
-}
-
-/// Return a [`NamedTempFile`] in the specified directory.
-#[cfg(not(unix))]
-fn tempfile_in(path: &Path) -> io::Result<NamedTempFile> {
-    tempfile::Builder::new().tempfile_in(path)
-}
-
-/// On disk representation of a cache of a package.
-#[derive(rkyv::Archive, Debug, rkyv::Deserialize, rkyv::Serialize)]
-struct PackageCache {
-    /// Path to the root of the package.
-    ///
-    /// Usually this is a directory, but it can also be a single file in case of
-    /// single file "packages", e.g. scripts.
-    #[rkyv(with = rkyv::with::AsString)]
-    package_root: PathBuf,
-    /// Mapping of source file path to it's cached data.
-    #[rkyv(with = rkyv::with::MapKV<rkyv::with::AsString, rkyv::with::Identity>)]
-    files: FxHashMap<RelativePathBuf, FileCache>,
-}
-
-/// On disk representation of the cache per source file.
-#[derive(rkyv::Deserialize, rkyv::Serialize, Debug, rkyv::Archive)]
-pub(crate) struct FileCache {
-    /// Key that determines if the cached item is still valid.
-    key: u64,
-    /// Timestamp when we last linted this file.
-    ///
-    /// Represented as the number of milliseconds since Unix epoch. This will
-    /// break in 1970 + ~584 years (~2554).
-    #[rkyv(with = rkyv::with::AtomicLoad<rkyv::with::Relaxed>)]
-    last_seen: AtomicU64,
-
-    data: FileCacheData,
-}
-
-impl FileCache {
-    /// Return whether or not the file in the cache was linted and found to have no diagnostics.
-    pub(crate) fn linted(&self) -> bool {
-        self.data.linted
-    }
-}
-
-#[derive(Debug, Default, rkyv::Deserialize, rkyv::Serialize, rkyv::Archive)]
-struct FileCacheData {
-    linted: bool,
-    formatted: bool,
-}
-
-/// Returns a hash key based on the `package_root`, `settings` and the crate
-/// version.
-fn cache_key(package_root: &Path, settings: &Settings) -> u64 {
-    let mut hasher = CacheKeyHasher::new();
-    package_root.cache_key(&mut hasher);
-    settings.cache_key(&mut hasher);
-
-    hasher.finish()
-}
-
-/// Initialize the cache at the specified `Path`.
-fn init(path: &Path) -> Result<()> {
-    // Create the cache directories.
-    fs::create_dir_all(path.join(VERSION))?;
-
-    // Add the CACHEDIR.TAG.
-    cachedir::ensure_tag(path)?;
-
-    // Add the .gitignore.
-    match fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(path.join(".gitignore"))
-    {
-        Ok(mut file) => file.write_all(b"# Automatically created by ruff.\n*\n")?,
-        Err(err) if err.kind() == io::ErrorKind::AlreadyExists => (),
-        Err(err) => return Err(err.into()),
-    }
-
-    Ok(())
-}
-
-pub(crate) trait PackageCaches {
-    fn get(&self, package_root: &Path) -> Option<&Cache>;
-
-    fn persist(self) -> Result<()>;
-}
-
-impl<T> PackageCaches for Option<T>
-where
-    T: PackageCaches,
-{
-    fn get(&self, package_root: &Path) -> Option<&Cache> {
-        match self {
-            None => None,
-            Some(caches) => caches.get(package_root),
+    /// Creates `path`, marked as a cache directory and ignored by Git.
+    fn init(path: &Path) -> Result<()> {
+        fs::create_dir_all(path)?;
+        cachedir::ensure_tag(path)?;
+        match fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(path.join(".gitignore"))
+        {
+            Ok(mut file) => file.write_all(b"# Automatically created by ruff.\n*\n")?,
+            Err(err) if err.kind() == io::ErrorKind::AlreadyExists => {}
+            Err(err) => return Err(err.into()),
         }
-    }
-
-    fn persist(self) -> Result<()> {
-        match self {
-            None => Ok(()),
-            Some(caches) => caches.persist(),
-        }
+        Ok(())
     }
 }
 
-pub(crate) struct PackageCacheMap<'a>(FxHashMap<&'a Path, Cache>);
+/// The per-file results of one package, for one command.
+struct PackageCache<R> {
+    /// The package root: the cache's paths are relative to it.
+    root: PathBuf,
+    /// The running build.
+    build: BuildId,
+    /// The package's results.
+    cache: Cache<R>,
+}
 
-impl<'a> PackageCacheMap<'a> {
-    pub(crate) fn init(
-        package_roots: &FxHashMap<&'a Path, Option<PackageRoot<'a>>>,
-        resolver: &Resolver,
-    ) -> Self {
-        fn init_cache(path: &Path) {
-            if let Err(e) = init(path) {
-                error!("Failed to initialize cache at {}: {e:?}", path.display());
-            }
-        }
+/// The digests of the settings a run checks or formats files with, by the address of the
+/// [`Settings`] the resolver holds: computed once per configuration rather than once per file.
+struct SettingsKeys(FxHashMap<usize, u64>);
 
-        for settings in resolver.settings() {
-            init_cache(&settings.cache_dir);
-        }
-
+impl SettingsKeys {
+    /// Hashes the part of each of `resolver`'s settings that `part` picks: what a command's
+    /// results depend on.
+    fn new(resolver: &Resolver, part: fn(&Settings) -> &dyn CacheKey) -> Self {
         Self(
-            package_roots
-                .iter()
-                .map(|(package, package_root)| {
-                    package_root.map(PackageRoot::path).unwrap_or(package)
-                })
-                .unique()
-                .par_bridge()
-                .map(|cache_root| {
-                    let settings = resolver.resolve(cache_root);
-                    let cache = Cache::open(cache_root.to_path_buf(), settings);
-                    (cache_root, cache)
+            resolver
+                .settings()
+                .map(|settings| {
+                    let mut hasher = CacheKeyHasher::new();
+                    part(settings).cache_key(&mut hasher);
+                    (Self::address(settings), hasher.finish())
                 })
                 .collect(),
         )
     }
+
+    /// Returns the digest of `settings`, which the resolver holds.
+    fn get(&self, settings: &Settings) -> Option<u64> {
+        self.0.get(&Self::address(settings)).copied()
+    }
+
+    /// Returns where `settings` is: settings stay put in the resolver for the whole run.
+    fn address(settings: &Settings) -> usize {
+        std::ptr::from_ref(settings).addr()
+    }
 }
 
-impl PackageCaches for PackageCacheMap<'_> {
-    fn get(&self, package_root: &Path) -> Option<&Cache> {
-        let cache = self.0.get(package_root);
+/// The per-file results of a run of one command, by package root.
+pub(crate) struct PackageCaches<'a, R> {
+    /// The caches, by the package root (or directory, for a file outside any package) they hold
+    /// the results of.
+    packages: FxHashMap<&'a Path, PackageCache<R>>,
+    /// The cache directories they're in: their stores are committed once every cache is saved.
+    dirs: Vec<Arc<CacheDir>>,
+    /// The digests of the settings files are checked or formatted with.
+    settings: SettingsKeys,
+}
 
-        if cache.is_none() {
+impl<'a, R: Verdict> PackageCaches<'a, R> {
+    /// Opens the caches of `package_roots`, in the cache directory of each one's settings, for a
+    /// run that started at `started`. `part` picks what of a file's settings its result depends
+    /// on.
+    pub(crate) fn open(
+        package_roots: &FxHashMap<&'a Path, Option<PackageRoot<'a>>>,
+        resolver: &Resolver,
+        started: Timestamp,
+        part: fn(&Settings) -> &dyn CacheKey,
+    ) -> Self {
+        let dirs: FxHashMap<&Path, Option<OpenDir>> = resolver
+            .settings()
+            .map(|settings| settings.cache_dir.as_path())
+            .unique()
+            .map(|cache_dir| (cache_dir, OpenDir::open(cache_dir)))
+            .collect();
+        let packages = package_roots
+            .iter()
+            .map(|(package, package_root)| package_root.map(PackageRoot::path).unwrap_or(package))
+            .unique()
+            .par_bridge()
+            .filter_map(|root| {
+                let open = dirs
+                    .get(resolver.resolve(root).cache_dir.as_path())?
+                    .as_ref()?;
+                let name = format!("{}/{}", R::COMMAND, Digest::of(&root));
+                let cache = Cache::open(Arc::clone(&open.dir), name, started)
+                    .keep_unvisited_for(KEEP_UNVISITED);
+                let package = PackageCache {
+                    root: root.to_path_buf(),
+                    build: open.build,
+                    cache,
+                };
+                Some((root, package))
+            })
+            .collect();
+        Self {
+            packages,
+            dirs: dirs.into_values().flatten().map(|open| open.dir).collect(),
+            settings: SettingsKeys::new(resolver, part),
+        }
+    }
+
+    /// Returns the file at `path`, in the package rooted at `package_root`, checked or formatted
+    /// with `settings`, whose result also depends on `extra`. Returns `None` if it isn't cached:
+    /// it's outside the package, it's gone, or its path isn't UTF-8.
+    pub(crate) fn file(
+        &self,
+        package_root: &Path,
+        path: &Path,
+        settings: &Settings,
+        extra: impl Hash,
+    ) -> Option<CachedFile<'_, R>> {
+        let Some(package) = self.packages.get(package_root) else {
             debug!("No cache found for {}", package_root.display());
-        }
-
-        cache
+            return None;
+        };
+        let relative = path.strip_prefix(&package.root).ok()?;
+        let stat = Stat::of_target(path)?;
+        let settings = self.settings.get(settings)?;
+        let key = Digest::of(&(package.build, R::COMMAND, settings, stat.mode(), extra));
+        Some(CachedFile {
+            cache: &package.cache,
+            path: relative.to_path_buf(),
+            key,
+            stat,
+        })
     }
 
-    fn persist(self) -> Result<()> {
-        self.0
+    /// Saves every package's results, and commits what they used and added to their stores.
+    pub(crate) fn persist(self) {
+        self.packages
             .into_par_iter()
-            .try_for_each(|(_, cache)| cache.persist())
+            .for_each(|(_, package)| package.cache.save());
+        for dir in self.dirs {
+            dir.commit(Retention::default());
+        }
     }
 }
 
-#[derive(Debug)]
-struct Change {
+/// A file a command is about to read, and its cached result.
+pub(crate) struct CachedFile<'a, R> {
+    /// The package's results.
+    cache: &'a Cache<R>,
+    /// The file's path, relative to the package root.
     path: PathBuf,
-    new_key: u64,
-    new_data: ChangeData,
+    /// Everything the file's result depends on besides its path and content.
+    key: Digest,
+    /// The file's `stat`, taken before it's read.
+    stat: Stat,
 }
 
-#[derive(Debug)]
-enum ChangeData {
-    Linted(bool),
-    Formatted,
-}
+impl<R: Verdict> CachedFile<'_, R> {
+    /// Returns the file's result if its `stat` says it's unchanged: then it needn't be read.
+    pub(crate) fn by_stat(&self) -> Option<R> {
+        self.cache.get_by_stat(&self.path, self.key, self.stat)
+    }
 
-impl ChangeData {
-    fn apply(self, data: &mut FileCacheData) {
-        match self {
-            ChangeData::Linted(yes) => {
-                data.linted = yes;
-            }
-            ChangeData::Formatted => {
-                data.formatted = true;
-            }
+    /// Returns the file's result for `content`, its digest once read.
+    pub(crate) fn by_content(&self, content: Digest) -> Option<R> {
+        self.cache
+            .get_by_content(&self.path, self.key, self.stat, content)
+    }
+
+    /// Puts `result` for the file, read as `content`.
+    pub(crate) fn put(&self, content: Digest, result: R) {
+        self.cache
+            .put(&self.path, self.key, self.stat, content, result);
+    }
+
+    /// Puts `result` for the file after the command wrote `content` to it.
+    pub(crate) fn put_written(&self, content: Digest, result: R, absolute: &Path) {
+        if let Some(stat) = Stat::of_target(absolute) {
+            self.cache.put(&self.path, self.key, stat, content, result);
         }
+    }
+}
+
+/// A source file's bytes, read once to hash them and, on a miss, to check or format them.
+pub(crate) struct SourceBytes {
+    /// The file's content.
+    bytes: Vec<u8>,
+    /// Its digest.
+    digest: Digest,
+}
+
+impl SourceBytes {
+    /// Reads the file at `path`.
+    pub(crate) fn read(path: &Path) -> io::Result<Self> {
+        let bytes = fs::read(path)?;
+        let digest = Digest::of_bytes(&bytes);
+        Ok(Self { bytes, digest })
+    }
+
+    /// Returns the digest of the content.
+    pub(crate) fn digest(&self) -> Digest {
+        self.digest
+    }
+
+    /// Returns the source the content holds, as [`SourceKind::from_path`] reads it. A content
+    /// it can't read is read again with it, so that the error is the one an uncached run reports.
+    pub(crate) fn into_source_kind(
+        self,
+        path: &Path,
+        source_type: SourceType,
+    ) -> Result<Option<SourceKind>, SourceError> {
+        String::from_utf8(self.bytes)
+            .ok()
+            .and_then(|source| SourceKind::from_source_code(source, source_type).ok())
+            .map_or_else(|| SourceKind::from_path(path, source_type), Ok)
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use std::env::temp_dir;
     use std::fs;
-    use std::io;
-    use std::io::Write;
     use std::path::{Path, PathBuf};
-    use std::sync::atomic::AtomicU64;
-    use std::time::SystemTime;
+    use std::time::Duration;
 
-    use anyhow::Result;
     use filetime::{FileTime, set_file_mtime};
-    use itertools::Itertools;
-    use ruff_python_ast::SourceType;
     use test_case::test_case;
 
-    use ruff_cache::CACHE_DIR_NAME;
+    use ruff_file_cache::Timestamp;
     use ruff_linter::package::PackageRoot;
     use ruff_linter::registry::Rule;
     use ruff_linter::settings::LinterSettings;
     use ruff_linter::settings::flags;
     use ruff_linter::settings::types::UnsafeFixes;
-    use ruff_python_ast::PySourceType;
+    use ruff_python_ast::{PySourceType, SourceType};
     use ruff_workspace::Settings;
+    use ruff_workspace::resolver::{
+        PyprojectDiscoveryStrategy, ResolvedSettings, Resolver, RootSettings,
+    };
+    use rustc_hash::FxHashMap;
 
-    use crate::cache::{self, ChangeData, FileCache, FileCacheData, FileCacheKey};
-    use crate::cache::{Cache, RelativePathBuf};
-    use crate::commands::format::{FormatCommandError, FormatMode, FormatResult, format_path};
+    use super::{Clean, Formatted, PackageCaches};
+    use crate::commands::format::{FormatMode, FormatResult, format_path};
     use crate::diagnostics::{Diagnostics, lint_path};
 
-    #[test_case("../ruff_linter/resources/test/fixtures", "ruff_tests/cache_same_results_ruff_linter"; "ruff_linter_fixtures")]
-    #[test_case("../ruff_notebook/resources/test/fixtures", "ruff_tests/cache_same_results_ruff_notebook"; "ruff_notebook_fixtures")]
-    fn same_results(package_root: &str, cache_dir_path: &str) {
-        let mut cache_dir = temp_dir();
-        cache_dir.push(cache_dir_path);
-        let _ = fs::remove_dir_all(&cache_dir);
-        cache::init(&cache_dir).unwrap();
+    /// A package of files, linted and formatted with a cache.
+    struct TestPackage {
+        _tmp: tempfile::TempDir,
+        root: PathBuf,
+        root_settings: RootSettings,
+    }
 
-        let settings = Settings {
-            cache_dir,
-            linter: LinterSettings::for_rule(Rule::UnusedVariable),
-            ..Settings::default()
-        };
-
-        let package_root = fs::canonicalize(package_root).unwrap();
-        let cache = Cache::open(package_root.clone(), &settings);
-        assert_eq!(cache.changes.lock().unwrap().len(), 0);
-
-        let mut paths = Vec::new();
-        let mut paths_with_diagnostics = Vec::new();
-        let mut expected_diagnostics = Diagnostics::default();
-        for entry in fs::read_dir(&package_root).unwrap() {
-            let entry = entry.unwrap();
-            if !entry.file_type().unwrap().is_dir() {
-                continue;
+    impl TestPackage {
+        fn new(rules: Vec<Rule>) -> Self {
+            let tmp = tempfile::tempdir().unwrap();
+            let root = dunce::canonicalize(tmp.path()).unwrap().join("package");
+            fs::create_dir_all(&root).unwrap();
+            let settings = Settings {
+                cache_dir: tmp.path().join(".ruff_cache"),
+                linter: LinterSettings::for_rules(rules),
+                ..Settings::default()
+            };
+            Self {
+                _tmp: tmp,
+                root,
+                root_settings: RootSettings {
+                    strategy: PyprojectDiscoveryStrategy::Fixed,
+                    resolved: ResolvedSettings::new(settings),
+                },
             }
+        }
 
-            let dir_path = entry.path();
-            if dir_path.ends_with(CACHE_DIR_NAME) {
-                continue;
-            }
+        fn write(&self, name: &str, source: &str) -> PathBuf {
+            let path = self.root.join(name);
+            fs::write(&path, source).unwrap();
+            path
+        }
 
-            for entry in fs::read_dir(dir_path).unwrap() {
-                let entry = entry.unwrap();
-                if !entry.file_type().unwrap().is_file() {
-                    continue;
-                }
+        /// When a run starts that trusts every `stat` taken before the test's writes.
+        fn later() -> Timestamp {
+            Timestamp::now() + Duration::from_secs(10)
+        }
 
-                let path = entry.path();
-                if path.ends_with("pyproject.toml") || path.ends_with("R.ipynb") {
-                    continue;
-                }
+        fn package_roots(&self) -> FxHashMap<&Path, Option<PackageRoot<'_>>> {
+            FxHashMap::from_iter([(self.root.as_path(), Some(PackageRoot::root(&self.root)))])
+        }
 
-                let mut diagnostics = lint_path(
-                    &path,
-                    Some(PackageRoot::root(&package_root)),
+        /// Lints `paths` with the cache, as a run started at `started`.
+        fn lint(&self, paths: &[&Path], started: Timestamp) -> Diagnostics {
+            let resolver = Resolver::new(&self.root_settings);
+            let package_roots = self.package_roots();
+            let caches =
+                PackageCaches::<Clean>::open(&package_roots, &resolver, started, |s| &s.linter);
+            let mut diagnostics = Diagnostics::default();
+            for path in paths {
+                let package = Some(PackageRoot::root(&self.root));
+                let settings = resolver.resolve(path);
+                diagnostics += lint_path(
+                    path,
+                    package,
                     &settings.linter,
-                    Some(&cache),
+                    caches.file(&self.root, path, settings, package),
                     flags::Noqa::Enabled,
                     flags::FixMode::Generate,
                     UnsafeFixes::Enabled,
                 )
                 .unwrap();
-                if diagnostics.inner.is_empty() {
-                    // We won't load a notebook index from the cache for files without diagnostics,
-                    // so remove them from `expected_diagnostics` too. This allows us to keep the
-                    // full equality assertion below.
-                    diagnostics
-                        .notebook_indexes
-                        .remove(&path.to_string_lossy().to_string());
-                } else {
-                    paths_with_diagnostics.push(path.clone());
-                }
-                paths.push(path);
-                expected_diagnostics += diagnostics;
             }
-        }
-        assert_ne!(paths, &[] as &[std::path::PathBuf], "no files checked");
-
-        cache.persist().unwrap();
-
-        let cache = Cache::open(package_root.clone(), &settings);
-        assert_ne!(cache.package.files.len(), 0);
-
-        paths_with_diagnostics.sort();
-
-        for path in &paths {
-            if paths_with_diagnostics.binary_search(path).is_ok() {
-                continue; // We don't cache files with diagnostics.
-            }
-
-            let relative_path = cache.relative_path(path).unwrap();
-
-            assert!(
-                cache.package.files.contains_key(relative_path),
-                "missing file from cache: `{}`",
-                relative_path.display()
-            );
+            caches.persist();
+            diagnostics
         }
 
-        let mut got_diagnostics = Diagnostics::default();
-        for path in paths {
-            got_diagnostics += lint_path(
-                &path,
-                Some(PackageRoot::root(&package_root)),
-                &settings.linter,
-                Some(&cache),
-                flags::Noqa::Enabled,
-                flags::FixMode::Generate,
-                UnsafeFixes::Enabled,
+        /// Returns whether the cache knows `path` is clean from its `stat` alone.
+        fn known_clean_by_stat(&self, path: &Path) -> bool {
+            let resolver = Resolver::new(&self.root_settings);
+            let package_roots = self.package_roots();
+            let caches =
+                PackageCaches::<Clean>::open(&package_roots, &resolver, Self::later(), |s| {
+                    &s.linter
+                });
+            let package = Some(PackageRoot::root(&self.root));
+            caches
+                .file(&self.root, path, resolver.resolve(path), package)
+                .is_some_and(|file| file.by_stat().is_some())
+        }
+
+        /// Formats `path` with the cache, as a run started at `started`.
+        fn format(&self, path: &Path, mode: FormatMode, started: Timestamp) -> FormatResult {
+            let resolver = Resolver::new(&self.root_settings);
+            let package_roots = self.package_roots();
+            let caches =
+                PackageCaches::<Formatted>::open(&package_roots, &resolver, started, |s| {
+                    &s.formatter
+                });
+            let settings = resolver.resolve(path);
+            let result = format_path(
+                path,
+                &settings.formatter,
+                SourceType::Python(PySourceType::Python),
+                mode,
+                None,
+                caches.file(&self.root, path, settings, ()),
             )
             .unwrap();
+            caches.persist();
+            result
         }
+    }
 
-        assert_eq!(
-            expected_diagnostics, got_diagnostics,
-            "left == {expected_diagnostics:#?}, right == {got_diagnostics:#?}",
-        );
+    #[test_case("../ruff_linter/resources/test/fixtures/pyflakes"; "pyflakes_fixtures")]
+    #[test_case("../ruff_notebook/resources/test/fixtures/jupyter"; "notebook_fixtures")]
+    fn a_cached_run_finds_what_an_uncached_run_finds(fixtures: &str) {
+        let package = TestPackage::new(vec![Rule::UnusedVariable, Rule::UnusedImport]);
+        let mut paths = Vec::new();
+        for entry in fs::read_dir(fixtures).unwrap() {
+            let path = entry.unwrap().path();
+            let extension = path.extension().and_then(|extension| extension.to_str());
+            if path.is_file()
+                && matches!(extension, Some("py" | "ipynb"))
+                && let Some(name) = path.file_name()
+            {
+                fs::copy(&path, package.root.join(name)).unwrap();
+                paths.push(package.root.join(name));
+            }
+        }
+        paths.sort();
+        assert!(!paths.is_empty(), "no files checked");
+
+        let started = TestPackage::later();
+        let paths: Vec<&Path> = paths.iter().map(PathBuf::as_path).collect();
+        let uncached = package.lint(&paths, started);
+        let cached = package.lint(&paths, started);
+        assert_eq!(uncached.inner, cached.inner);
     }
 
     #[test]
-    fn cache_adds_file_on_lint() {
-        let source: &[u8] = b"a = 1\n\n__all__ = list([\"a\"])\n";
-
-        let test_cache = TestCache::new("cache_adds_file_on_lint");
-        let cache = test_cache.open();
-        test_cache.write_source_file("source.py", source);
-        assert_eq!(cache.changes.lock().unwrap().len(), 0);
-
-        cache.persist().unwrap();
-        let cache = test_cache.open();
-
-        test_cache
-            .lint_file_with_cache("source.py", &cache)
-            .expect("Failed to lint test file");
-        assert_eq!(
-            cache.changes.lock().unwrap().len(),
-            1,
-            "A single new file should be added to the cache"
-        );
-
-        cache.persist().unwrap();
+    fn a_clean_file_is_skipped_and_one_with_diagnostics_is_not() {
+        let package = TestPackage::new(vec![Rule::UnusedImport]);
+        let clean = package.write("clean.py", "a = 1\n");
+        let unclean = package.write("unclean.py", "import os\n");
+        let started = TestPackage::later();
+        assert_eq!(package.lint(&[&clean, &unclean], started).inner.len(), 1);
+        assert!(package.known_clean_by_stat(&clean));
+        assert!(!package.known_clean_by_stat(&unclean));
+        assert!(package.lint(&[&clean], started).inner.is_empty());
+        assert_eq!(package.lint(&[&unclean], started).inner.len(), 1);
     }
 
     #[test]
-    fn cache_adds_files_on_lint() {
-        let source: &[u8] = b"a = 1\n\n__all__ = list([\"a\"])\n";
+    fn an_edit_that_puts_the_mtime_back_is_seen() {
+        let package = TestPackage::new(vec![Rule::UnusedImport]);
+        let path = package.write("source.py", "x = 12345\n");
+        let started = TestPackage::later();
+        assert!(package.lint(&[&path], started).inner.is_empty());
 
-        let test_cache = TestCache::new("cache_adds_files_on_lint");
-        let cache = test_cache.open();
-        test_cache.write_source_file("source_1.py", source);
-        test_cache.write_source_file("source_2.py", source);
-        assert_eq!(cache.changes.lock().unwrap().len(), 0);
-
-        cache.persist().unwrap();
-        let cache = test_cache.open();
-
-        test_cache
-            .lint_file_with_cache("source_1.py", &cache)
-            .expect("Failed to lint test file");
-        test_cache
-            .lint_file_with_cache("source_2.py", &cache)
-            .expect("Failed to lint test file");
-        assert_eq!(
-            cache.changes.lock().unwrap().len(),
-            2,
-            "Both files should be added to the cache"
-        );
-        cache.persist().unwrap();
+        let mtime = FileTime::from_last_modification_time(&fs::metadata(&path).unwrap());
+        fs::write(&path, "import os\n").unwrap();
+        set_file_mtime(&path, mtime).unwrap();
+        // The edit is the same size too: only the inode change time tells.
+        assert!(!package.known_clean_by_stat(&path));
+        let started = TestPackage::later();
+        assert_eq!(package.lint(&[&path], started).inner.len(), 1);
     }
 
     #[test]
-    fn cache_does_not_add_file_on_lint_with_diagnostic() {
-        let source: &[u8] = b"a = 1\n\n__all__ = list([\"a\", \"b\"])\n";
-
-        let test_cache = TestCache::new("cache_does_not_add_file_on_lint_with_diagnostic");
-        let cache = test_cache.open();
-        test_cache.write_source_file("source.py", source);
-        assert_eq!(cache.changes.lock().unwrap().len(), 0);
-
-        cache.persist().unwrap();
-        let cache = test_cache.open();
-
-        let results = test_cache
-            .lint_file_with_cache("source.py", &cache)
-            .expect("Failed to lint test file");
-        assert_eq!(results.inner.len(), 1, "Expected one F822 diagnostic");
-        assert_eq!(
-            cache.changes.lock().unwrap().len(),
-            1,
-            "Files with diagnostics still trigger change events"
+    fn a_touched_file_keeps_its_result_by_content() {
+        let package = TestPackage::new(vec![Rule::UnusedImport]);
+        let path = package.write("source.py", "a = 1\n");
+        let started = TestPackage::later();
+        assert!(package.lint(&[&path], started).inner.is_empty());
+        fs::write(&path, "a = 1\n").unwrap();
+        assert!(!package.known_clean_by_stat(&path));
+        assert!(
+            package
+                .lint(&[&path], TestPackage::later())
+                .inner
+                .is_empty()
         );
         assert!(
-            cache
-                .changes
-                .lock()
-                .unwrap()
-                .last()
-                .is_some_and(|change| matches!(change.new_data, ChangeData::Linted(false))),
-            "Files with diagnostics are marked as unlinted"
-        );
-
-        cache.persist().unwrap();
-    }
-
-    #[test]
-    fn cache_adds_files_on_format() {
-        let source: &[u8] = b"a = 1\n\n__all__ = list([\"a\", \"b\"])\n";
-
-        let test_cache = TestCache::new("cache_adds_files_on_format");
-        let cache = test_cache.open();
-        test_cache.write_source_file("source_1.py", source);
-        test_cache.write_source_file("source_2.py", source);
-        assert_eq!(cache.changes.lock().unwrap().len(), 0);
-
-        cache.persist().unwrap();
-        let cache = test_cache.open();
-
-        test_cache
-            .format_file_with_cache("source_1.py", &cache)
-            .expect("Failed to format test file");
-        test_cache
-            .format_file_with_cache("source_2.py", &cache)
-            .expect("Failed to format test file");
-        assert_eq!(
-            cache.changes.lock().unwrap().len(),
-            2,
-            "Both files should be added to the cache"
-        );
-
-        cache.persist().unwrap();
-    }
-
-    #[test]
-    fn cache_invalidated_on_file_modified_time() {
-        let source: &[u8] = b"a = 1\n\n__all__ = list([\"a\"])\n";
-
-        let test_cache = TestCache::new("cache_invalidated_on_file_modified_time");
-        let cache = test_cache.open();
-        let source_path = test_cache.write_source_file("source.py", source);
-        assert_eq!(cache.changes.lock().unwrap().len(), 0);
-
-        let expected_diagnostics = test_cache
-            .lint_file_with_cache("source.py", &cache)
-            .expect("Failed to lint test file");
-
-        cache.persist().unwrap();
-        let cache = test_cache.open();
-
-        // Update the modified time of the file to a time in the future
-        set_file_mtime(
-            source_path,
-            FileTime::from_system_time(SystemTime::now() + std::time::Duration::from_secs(1)),
-        )
-        .unwrap();
-
-        let got_diagnostics = test_cache
-            .lint_file_with_cache("source.py", &cache)
-            .expect("Failed to lint test file");
-
-        assert_eq!(
-            cache.changes.lock().unwrap().len(),
-            1,
-            "Cache should not be used, the file should be treated as new and added to the cache"
-        );
-
-        assert_eq!(
-            expected_diagnostics, got_diagnostics,
-            "The diagnostics should not change"
-        );
-    }
-
-    #[test]
-    fn cache_invalidated_on_permission_change() {
-        // Regression test for issue #3086.
-
-        #[cfg(unix)]
-        fn flip_execute_permission_bit(path: &Path) -> io::Result<()> {
-            use std::os::unix::fs::PermissionsExt;
-            let file = fs::OpenOptions::new().write(true).open(path)?;
-            let perms = file.metadata()?.permissions();
-            file.set_permissions(PermissionsExt::from_mode(perms.mode() ^ 0o111))
-        }
-
-        #[cfg(windows)]
-        fn flip_read_only_permission(path: &Path) -> io::Result<()> {
-            let file = fs::OpenOptions::new().write(true).open(path)?;
-            let mut perms = file.metadata()?.permissions();
-            perms.set_readonly(!perms.readonly());
-            file.set_permissions(perms)
-        }
-
-        let source: &[u8] = b"a = 1\n\n__all__ = list([\"a\"])\n";
-
-        let test_cache = TestCache::new("cache_invalidated_on_permission_change");
-        let cache = test_cache.open();
-        let path = test_cache.write_source_file("source.py", source);
-        assert_eq!(cache.changes.lock().unwrap().len(), 0);
-
-        let expected_diagnostics = test_cache
-            .lint_file_with_cache("source.py", &cache)
-            .unwrap();
-
-        cache.persist().unwrap();
-        let cache = test_cache.open();
-
-        // Flip the permissions on the file
-        #[cfg(unix)]
-        flip_execute_permission_bit(&path).unwrap();
-        #[cfg(windows)]
-        flip_read_only_permission(&path).unwrap();
-
-        let got_diagnostics = test_cache
-            .lint_file_with_cache("source.py", &cache)
-            .unwrap();
-
-        assert_eq!(
-            cache.changes.lock().unwrap().len(),
-            1,
-            "Cache should not be used, the file should be treated as new and added to the cache"
-        );
-
-        assert_eq!(
-            expected_diagnostics, got_diagnostics,
-            "The diagnostics should not change"
-        );
-    }
-
-    #[test]
-    fn cache_removes_stale_files_on_persist() {
-        let test_cache = TestCache::new("cache_removes_stale_files_on_persist");
-        let mut cache = test_cache.open();
-
-        // Add a file to the cache that hasn't been linted or seen since the '70s!
-        let old_path_key = RelativePathBuf::from("old.py");
-        cache.package.files.insert(
-            old_path_key,
-            FileCache {
-                key: 123,
-                last_seen: AtomicU64::new(123),
-                data: FileCacheData::default(),
-            },
-        );
-
-        // Now actually lint a file.
-        let source: &[u8] = b"a = 1\n\n__all__ = list([\"a\"])\n";
-        test_cache.write_source_file("new.py", source);
-        let new_path_key = RelativePathBuf::from("new.py");
-        assert_eq!(cache.changes.lock().unwrap().len(), 0);
-
-        test_cache
-            .lint_file_with_cache("new.py", &cache)
-            .expect("Failed to lint test file");
-
-        // Storing the cache should remove the old (`old.py`) file.
-        cache.persist().unwrap();
-        // So we when we open the cache again it shouldn't contain `old.py`.
-        let cache = test_cache.open();
-
-        assert_eq!(
-            cache.package.files.keys().collect_vec(),
-            vec![&new_path_key],
-            "Only the new file should be present"
+            package.known_clean_by_stat(&path),
+            "kept again by its new stat"
         );
     }
 
     #[cfg(unix)]
     #[test]
-    fn cache_file_permissions_match_default_file_permissions() {
-        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
-
-        let source: &[u8] = b"a = 1\n\n__all__ = list([\"a\"])\n";
-
-        let test_cache = TestCache::new("cache_file_permissions_match_default_file_permissions");
-        let cache = test_cache.open();
-        let cache_path = cache.path.clone();
-        test_cache.write_source_file("source.py", source);
-
-        test_cache
-            .lint_file_with_cache("source.py", &cache)
-            .expect("Failed to lint test file");
-        cache.persist().unwrap();
-
-        let control_path = cache_path.with_extension("control");
-        fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o666)
-            .open(&control_path)
-            .unwrap();
-
-        let cache_mode = fs::metadata(&cache_path).unwrap().permissions().mode() & 0o777;
-        let control_mode = fs::metadata(&control_path).unwrap().permissions().mode() & 0o777;
-
-        assert_eq!(
-            cache_mode, control_mode,
-            "Cache files should respect the same default permissions as regular files"
-        );
+    fn a_permission_change_is_seen() {
+        use std::os::unix::fs::PermissionsExt;
+        let package = TestPackage::new(vec![Rule::NonExecutableFileWithShebang]);
+        let path = package.write("script.py", "#!/usr/bin/env python\n");
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+        let started = TestPackage::later();
+        if !package.lint(&[&path], started).inner.is_empty() {
+            // The file system can't tell executable files (as under WSL): nothing to check.
+            return;
+        }
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+        assert_eq!(package.lint(&[&path], TestPackage::later()).inner.len(), 1);
     }
 
     #[test]
-    fn format_updates_cache_entry() {
-        let source: &[u8] = b"a = 1\n\n__all__ = list([\"a\"])\n";
-
-        let test_cache = TestCache::new("format_updates_cache_entry");
-        let cache = test_cache.open();
-        test_cache.write_source_file("source.py", source);
-        assert_eq!(cache.changes.lock().unwrap().len(), 0);
-
-        cache.persist().unwrap();
-        let cache = test_cache.open();
-
-        // Cache the lint results
-        test_cache
-            .lint_file_with_cache("source.py", &cache)
-            .expect("Failed to lint test file");
-        cache.persist().unwrap();
-
-        let mut cache = test_cache.open();
-
-        // Now lint the file
-        test_cache
-            .format_file_with_cache("source.py", &cache)
-            .expect("Failed to format test file");
-
-        cache.save();
-
-        assert_eq!(cache.package.files.len(), 1);
-
-        let Some(file_cache) = cache.get(
-            Path::new("source.py"),
-            &FileCacheKey::from_path(&test_cache.package_root.join("source.py")).unwrap(),
-        ) else {
-            panic!("Cache entry for `source.py` is missing.");
-        };
-
-        assert!(file_cache.data.linted);
-        assert!(file_cache.data.formatted);
-    }
-
-    #[test]
-    fn file_changes_invalidate_file_cache() {
-        let source: &[u8] = b"a = 1\n\n__all__ = list([\"a\", \"b\"])\n";
-
-        let test_cache = TestCache::new("file_changes_invalidate_file_cache");
-        let cache = test_cache.open();
-        let source_path = test_cache.write_source_file("source.py", source);
-        assert_eq!(cache.changes.lock().unwrap().len(), 0);
-
-        cache.persist().unwrap();
-        let cache = test_cache.open();
-
-        // Cache the format and lint results
-        test_cache
-            .lint_file_with_cache("source.py", &cache)
-            .expect("Failed to lint test file");
-        test_cache
-            .format_file_with_cache("source.py", &cache)
-            .expect("Failed to format test file");
-
-        cache.persist().unwrap();
-
-        let mut cache = test_cache.open();
-        assert_eq!(cache.package.files.len(), 1);
-
-        set_file_mtime(
-            &source_path,
-            FileTime::from_system_time(SystemTime::now() + std::time::Duration::from_secs(1)),
-        )
-        .unwrap();
-
-        test_cache
-            .format_file_with_cache("source.py", &cache)
-            .expect("Failed to format test file");
-
-        cache.save();
-
-        assert_eq!(cache.package.files.len(), 1);
-
-        let Some(file_cache) = cache.get(
-            Path::new("source.py"),
-            &FileCacheKey::from_path(&source_path).unwrap(),
-        ) else {
-            panic!("Cache entry for `source.py` is missing.");
-        };
-
-        assert!(!file_cache.data.linted);
-        assert!(file_cache.data.formatted);
-    }
-
-    struct TestCache {
-        package_root: PathBuf,
-        settings: Settings,
-    }
-
-    impl TestCache {
-        fn new(test_case: &str) -> Self {
-            // Build a new cache directory and clear it
-            let mut test_dir = temp_dir();
-            test_dir.push("ruff_tests/cache");
-            test_dir.push(test_case);
-
-            let _ = fs::remove_dir_all(&test_dir);
-
-            // Create separate directories for the cache and the test package
-            let cache_dir = test_dir.join("cache");
-            let package_root = test_dir.join("package");
-
-            cache::init(&cache_dir).unwrap();
-            fs::create_dir(package_root.clone()).unwrap();
-
-            let settings = Settings {
-                cache_dir,
-                linter: LinterSettings::for_rule(Rule::UndefinedExport),
-                ..Settings::default()
-            };
-
-            Self {
-                package_root,
-                settings,
-            }
-        }
-
-        fn write_source_file(&self, path: &str, contents: &[u8]) -> PathBuf {
-            let path = self.package_root.join(path);
-            let mut file = fs::OpenOptions::new()
-                .write(true)
-                .create(true)
-                .truncate(true)
-                .open(&*path)
-                .unwrap();
-            file.write_all(contents).unwrap();
-            file.sync_data().unwrap();
-            path
-        }
-
-        fn open(&self) -> Cache {
-            Cache::open(self.package_root.clone(), &self.settings)
-        }
-
-        fn lint_file_with_cache(
-            &self,
-            path: &str,
-            cache: &Cache,
-        ) -> Result<Diagnostics, anyhow::Error> {
-            lint_path(
-                &self.package_root.join(path),
-                Some(PackageRoot::root(&self.package_root)),
-                &self.settings.linter,
-                Some(cache),
-                flags::Noqa::Enabled,
-                flags::FixMode::Generate,
-                UnsafeFixes::Enabled,
-            )
-        }
-
-        fn format_file_with_cache(
-            &self,
-            path: &str,
-            cache: &Cache,
-        ) -> Result<FormatResult, FormatCommandError> {
-            let file_path = self.package_root.join(path);
-            format_path(
-                &file_path,
-                &self.settings.formatter,
-                SourceType::Python(PySourceType::Python),
-                FormatMode::Write,
-                None,
-                Some(cache),
-            )
-        }
-    }
-
-    impl Drop for TestCache {
-        fn drop(&mut self) {
-            let _ = fs::remove_dir_all(&self.settings.cache_dir);
-        }
+    fn a_formatted_file_is_skipped_and_a_written_one_kept_by_content() {
+        let package = TestPackage::new(vec![]);
+        let path = package.write("source.py", "a  =  1\n");
+        let started = TestPackage::later();
+        assert!(matches!(
+            package.format(&path, FormatMode::Check, started),
+            FormatResult::Diff { .. }
+        ));
+        assert!(matches!(
+            package.format(&path, FormatMode::Write, started),
+            FormatResult::Formatted
+        ));
+        assert_eq!(fs::read_to_string(&path).unwrap(), "a = 1\n");
+        assert!(matches!(
+            package.format(&path, FormatMode::Check, TestPackage::later()),
+            FormatResult::Unchanged
+        ));
+        fs::write(&path, "a  =  2\n").unwrap();
+        assert!(matches!(
+            package.format(&path, FormatMode::Check, TestPackage::later()),
+            FormatResult::Diff { .. }
+        ));
     }
 }

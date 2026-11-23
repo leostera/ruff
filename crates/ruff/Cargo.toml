@@ -24,9 +24,9 @@ ruff_cache = { workspace = true }
 ruff_command_line = { workspace = true }
 ruff_db = { workspace = true, default-features = false, features = ["os"] }
 ruff_diagnostics = { workspace = true }
+ruff_file_cache = { workspace = true }
 ruff_graph = { workspace = true, features = ["serde", "clap"] }
 ruff_linter = { workspace = true, features = ["clap"] }
-ruff_macros = { workspace = true }
 ruff_markdown = { workspace = true }
 ruff_notebook = { workspace = true }
 ruff_options_metadata = { workspace = true, features = ["serde"] }
@@ -40,7 +40,6 @@ ruff_text_size = { workspace = true }
 ruff_workspace = { workspace = true }
 
 anyhow = { workspace = true }
-rkyv = { workspace = true }
 bitflags = { workspace = true }
 cachedir = { workspace = true }
 clap = { workspace = true, features = ["derive", "env", "wrap_help"] }

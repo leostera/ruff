@@ -1,7 +1,7 @@
 use std::path::Path;
 
 /// The root directory of a Python package.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum PackageRoot<'a> {
     /// A normal package root.
     Root { path: &'a Path },

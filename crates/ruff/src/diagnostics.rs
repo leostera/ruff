@@ -7,7 +7,7 @@ use std::io::Write;
 use std::ops::{Add, AddAssign};
 use std::path::Path;
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use colored::Colorize;
 use log::{debug, warn};
 use ruff_db::diagnostic::Diagnostic;
@@ -26,7 +26,7 @@ use ruff_source_file::SourceFileBuilder;
 use ruff_text_size::TextRange;
 use rustc_hash::FxHashMap;
 
-use crate::cache::{Cache, FileCache, FileCacheKey};
+use crate::cache::{CachedFile, Clean, SourceBytes};
 
 /// A collection of [`Diagnostic`]s and additional information needed to render them.
 ///
@@ -178,37 +178,24 @@ impl AddAssign for FixMap {
     }
 }
 
-/// Lint the source code at the given `Path`.
+/// Lint the source code at the given `Path`, skipping it if `cache` knows it has no diagnostics.
 pub(crate) fn lint_path(
     path: &Path,
     package: Option<PackageRoot<'_>>,
     settings: &LinterSettings,
-    cache: Option<&Cache>,
+    cache: Option<CachedFile<'_, Clean>>,
     noqa: flags::Noqa,
     fix_mode: flags::FixMode,
     unsafe_fixes: UnsafeFixes,
 ) -> Result<Diagnostics> {
-    // Check the cache.
-    let caching = match cache {
-        Some(cache) if noqa.is_enabled() => {
-            let relative_path = cache
-                .relative_path(path)
-                .expect("wrong package cache for file");
-
-            let cache_key = FileCacheKey::from_path(path).context("Failed to create cache key")?;
-            let cached_diagnostics = cache
-                .get(relative_path, &cache_key)
-                .is_some_and(FileCache::linted);
-            if cached_diagnostics {
-                return Ok(Diagnostics::default());
-            }
-
-            // Stash the file metadata for later so when we update the cache it reflects the prerun
-            // information
-            Some((cache, relative_path, cache_key))
-        }
-        _ => None,
-    };
+    // Without `noqa`, a file may have diagnostics that a cached run would hide.
+    let cache = cache.filter(|_| noqa.is_enabled());
+    if cache
+        .as_ref()
+        .is_some_and(|cache| cache.by_stat().is_some())
+    {
+        return Ok(Diagnostics::default());
+    }
 
     debug!("Checking: {}", path.display());
 
@@ -272,8 +259,19 @@ pub(crate) fn lint_path(
         SourceType::Python(source_type) => source_type,
     };
 
-    // Extract the sources from the file.
-    let source_kind = match SourceKind::from_path(path, SourceType::Python(source_type)) {
+    // Extract the sources from the file, read once to look its content up in the cache too.
+    let source = cache.as_ref().and_then(|_| SourceBytes::read(path).ok());
+    let content = source.as_ref().map(SourceBytes::digest);
+    if let (Some(cache), Some(content)) = (&cache, content)
+        && cache.by_content(content).is_some()
+    {
+        return Ok(Diagnostics::default());
+    }
+    let source_kind = match source {
+        Some(source) => source.into_source_kind(path, SourceType::Python(source_type)),
+        None => SourceKind::from_path(path, SourceType::Python(source_type)),
+    };
+    let source_kind = match source_kind {
         Ok(Some(source_kind)) => match source_kind {
             SourceKind::Markdown(_) => return Ok(Diagnostics::default()), // skip linting markdown
             _ => source_kind,
@@ -351,7 +349,7 @@ pub(crate) fn lint_path(
 
     let diagnostics = result.diagnostics;
 
-    if let Some((cache, relative_path, key)) = caching {
+    if let (Some(cache), Some(content)) = (cache, content) {
         // `FixMode::Apply` and `FixMode::Diff` rely on side-effects (writing to disk,
         // and writing the diff to stdout, respectively). If a file has diagnostics
         // with fixes, we need to avoid reading from and writing to the cache in these
@@ -362,8 +360,9 @@ pub(crate) fn lint_path(
         };
 
         // We don't cache files with diagnostics.
-        let linted = diagnostics.is_empty() && use_fixes;
-        cache.set_linted(relative_path.to_owned(), &key, linted);
+        if diagnostics.is_empty() && use_fixes {
+            cache.put(content, Clean);
+        }
     }
 
     let notebook_indexes = if let SourceKind::IpyNotebook(notebook) = transformed {

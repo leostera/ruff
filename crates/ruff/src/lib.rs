@@ -308,13 +308,6 @@ pub fn check(args: CheckCommand, global_options: GlobalConfigArgs) -> Result<Exi
         printer_flags |= PrinterFlags::SHOW_FIX_SUMMARY;
     }
 
-    #[cfg(debug_assertions)]
-    if cache {
-        // `--no-cache` doesn't respect code changes, and so is often confusing during
-        // development.
-        warn_user!("Detected debug build without --no-cache.");
-    }
-
     let suppression = cli
         .add_noqa
         .as_ref()

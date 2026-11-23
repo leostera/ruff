@@ -1,5 +1,4 @@
 use std::fmt::{Display, Formatter};
-use std::fs::File;
 use std::io;
 use std::io::{BufWriter, Write, stderr, stdout};
 use std::path::{Path, PathBuf};
@@ -25,6 +24,7 @@ use tracing::debug;
 
 use ruff_db::panic::{PanicError, catch_unwind};
 use ruff_diagnostics::{Edit, Fix, SourceMap};
+use ruff_file_cache::{Digest, Timestamp};
 use ruff_linter::fs;
 use ruff_linter::logging::{DisplayParseError, LogLevel};
 use ruff_linter::package::PackageRoot;
@@ -42,7 +42,7 @@ use ruff_workspace::resolver::{
 };
 
 use crate::args::{ConfigArguments, FormatArguments, FormatRange};
-use crate::cache::{Cache, FileCacheKey, PackageCacheMap, PackageCaches};
+use crate::cache::{CachedFile, Formatted, PackageCaches, SourceBytes};
 use crate::{ExitStatus, resolve_default_files};
 
 #[derive(Debug, Copy, Clone, is_macro::Is)]
@@ -73,6 +73,8 @@ pub(crate) fn format(
     config_arguments: &ConfigArguments,
     root_settings: &RootSettings,
 ) -> Result<ExitStatus> {
+    // Taken before anything is read: every `stat` the cache records counts as taken then.
+    let started = Timestamp::now();
     let mode = FormatMode::from_cli(&cli);
     let files = resolve_default_files(cli.files, false);
     let (paths, resolver) = project_files_in_path(&files, root_settings, config_arguments)?;
@@ -102,16 +104,11 @@ pub(crate) fn format(
             .collect::<Vec<_>>(),
     );
 
-    let caches = if cli.no_cache {
-        None
-    } else {
-        // `--no-cache` doesn't respect code changes, and so is often confusing during
-        // development.
-        #[cfg(debug_assertions)]
-        crate::warn_user!("Detected debug build without --no-cache.");
-
-        Some(PackageCacheMap::init(&package_roots, &resolver))
-    };
+    let caches = (!cli.no_cache).then(|| {
+        PackageCaches::<Formatted>::open(&package_roots, &resolver, started, |settings| {
+            &settings.formatter
+        })
+    });
 
     let start = Instant::now();
     let (results, mut errors): (Vec<_>, Vec<_>) = paths
@@ -146,7 +143,9 @@ pub(crate) fn format(
                     let cache_root = package
                         .map(PackageRoot::path)
                         .unwrap_or_else(|| path.parent().unwrap_or(path));
-                    let cache = caches.get(cache_root);
+                    let cache = caches
+                        .as_ref()
+                        .and_then(|caches| caches.file(cache_root, path, settings, ()));
 
                     Some(
                         match catch_unwind(|| {
@@ -186,7 +185,9 @@ pub(crate) fn format(
     );
 
     // Store the caches.
-    caches.persist()?;
+    if let Some(caches) = caches {
+        caches.persist();
+    }
 
     // Report on any errors.
     //
@@ -247,7 +248,7 @@ pub(crate) fn format(
     }
 }
 
-/// Format the file at the given [`Path`].
+/// Format the file at the given [`Path`], skipping it if `cache` knows it's formatted.
 #[tracing::instrument(level = "debug", skip_all, fields(path = %path.display()))]
 pub(crate) fn format_path(
     path: &Path,
@@ -255,22 +256,28 @@ pub(crate) fn format_path(
     source_type: SourceType,
     mode: FormatMode,
     range: Option<FormatRange>,
-    cache: Option<&Cache>,
+    cache: Option<CachedFile<'_, Formatted>>,
 ) -> Result<FormatResult, FormatCommandError> {
-    if let Some(cache) = cache {
-        let relative_path = cache
-            .relative_path(path)
-            .expect("wrong package cache for file");
-
-        if let Ok(cache_key) = FileCacheKey::from_path(path) {
-            if cache.is_formatted(relative_path, &cache_key) {
-                return Ok(FormatResult::Unchanged);
-            }
-        }
+    if cache
+        .as_ref()
+        .is_some_and(|cache| cache.by_stat().is_some())
+    {
+        return Ok(FormatResult::Unchanged);
     }
 
-    // Extract the sources from the file.
-    let unformatted = match SourceKind::from_path(path, source_type) {
+    // Extract the sources from the file, read once to look its content up in the cache too.
+    let source = cache.as_ref().and_then(|_| SourceBytes::read(path).ok());
+    let content = source.as_ref().map(SourceBytes::digest);
+    if let (Some(cache), Some(content)) = (&cache, content)
+        && cache.by_content(content).is_some()
+    {
+        return Ok(FormatResult::Unchanged);
+    }
+    let unformatted = match source {
+        Some(source) => source.into_source_kind(path, source_type),
+        None => SourceKind::from_path(path, source_type),
+    };
+    let unformatted = match unformatted {
         Ok(Some(source_kind)) => source_kind,
         // Non-Python Jupyter notebook.
         Ok(None) => return Ok(FormatResult::Skipped),
@@ -286,20 +293,15 @@ pub(crate) fn format_path(
     let format_result = match format_source(&unformatted, Some(path), settings, range)? {
         FormattedSource::Formatted(formatted) => match mode {
             FormatMode::Write => {
-                let mut writer = File::create(path).map_err(|err| {
+                let mut bytes = Vec::new();
+                formatted
+                    .write(&mut bytes)
+                    .map_err(|err| FormatCommandError::Write(Some(path.to_path_buf()), err))?;
+                std::fs::write(path, &bytes).map_err(|err| {
                     FormatCommandError::Write(Some(path.to_path_buf()), err.into())
                 })?;
-                formatted
-                    .write(&mut writer)
-                    .map_err(|err| FormatCommandError::Write(Some(path.to_path_buf()), err))?;
-
                 if let Some(cache) = cache {
-                    if let Ok(cache_key) = FileCacheKey::from_path(path) {
-                        let relative_path = cache
-                            .relative_path(path)
-                            .expect("wrong package cache for file");
-                        cache.set_formatted(relative_path.to_path_buf(), &cache_key);
-                    }
+                    cache.put_written(Digest::of_bytes(&bytes), Formatted, path);
                 }
 
                 FormatResult::Formatted
@@ -310,13 +312,8 @@ pub(crate) fn format_path(
             },
         },
         FormattedSource::Unchanged => {
-            if let Some(cache) = cache {
-                if let Ok(cache_key) = FileCacheKey::from_path(path) {
-                    let relative_path = cache
-                        .relative_path(path)
-                        .expect("wrong package cache for file");
-                    cache.set_formatted(relative_path.to_path_buf(), &cache_key);
-                }
+            if let (Some(cache), Some(content)) = (cache, content) {
+                cache.put(content, Formatted);
             }
 
             FormatResult::Unchanged

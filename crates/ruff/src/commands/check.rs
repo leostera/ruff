@@ -14,6 +14,7 @@ use ruff_python_ast::{SourceType, TomlSourceType};
 use rustc_hash::FxHashMap;
 
 use ruff_db::panic::catch_unwind;
+use ruff_file_cache::Timestamp;
 use ruff_linter::package::PackageRoot;
 use ruff_linter::registry::Rule;
 use ruff_linter::settings::types::UnsafeFixes;
@@ -26,7 +27,7 @@ use ruff_workspace::resolver::{
 };
 
 use crate::args::ConfigArguments;
-use crate::cache::{Cache, PackageCacheMap, PackageCaches};
+use crate::cache::{CachedFile, Clean, PackageCaches};
 use crate::diagnostics::Diagnostics;
 
 /// Run the linter over a collection of files.
@@ -39,6 +40,9 @@ pub(crate) fn check(
     fix_mode: flags::FixMode,
     unsafe_fixes: UnsafeFixes,
 ) -> Result<Diagnostics> {
+    // Taken before anything is read: every `stat` the cache records counts as taken then.
+    let started = Timestamp::now();
+
     // Collect all the Python files to check.
     let start = Instant::now();
     let (mut paths, resolver) = project_files_in_path(files, root_settings, config_arguments)?;
@@ -72,11 +76,11 @@ pub(crate) fn check(
     );
 
     // Load the caches.
-    let caches = if cache.is_enabled() {
-        Some(PackageCacheMap::init(&package_roots, &resolver))
-    } else {
-        None
-    };
+    let caches = cache.is_enabled().then(|| {
+        PackageCaches::<Clean>::open(&package_roots, &resolver, started, |settings| {
+            &settings.linter
+        })
+    });
 
     let start = Instant::now();
     let diagnostics_per_file = paths.par_iter().filter_map(|resolved_file| {
@@ -103,7 +107,9 @@ pub(crate) fn check(
                 let cache_root = package
                     .map(PackageRoot::path)
                     .unwrap_or_else(|| path.parent().unwrap_or(path));
-                let cache = caches.get(cache_root);
+                let cache = caches
+                    .as_ref()
+                    .and_then(|caches| caches.file(cache_root, path, settings, package));
 
                 lint_path(
                     path,
@@ -183,7 +189,9 @@ pub(crate) fn check(
     });
 
     // Store the caches.
-    caches.persist()?;
+    if let Some(caches) = caches {
+        caches.persist();
+    }
 
     let duration = start.elapsed();
     debug!("Checked {checked_files:?} files in: {duration:?}");
@@ -197,7 +205,7 @@ fn lint_path(
     path: &Path,
     package: Option<PackageRoot<'_>>,
     settings: &LinterSettings,
-    cache: Option<&Cache>,
+    cache: Option<CachedFile<'_, Clean>>,
     noqa: flags::Noqa,
     fix_mode: flags::FixMode,
     unsafe_fixes: UnsafeFixes,
