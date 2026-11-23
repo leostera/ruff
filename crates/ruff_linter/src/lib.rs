@@ -39,6 +39,7 @@ mod noqa;
 pub mod package;
 pub mod packaging;
 pub mod preview;
+pub mod probes;
 pub mod registry;
 mod renamer;
 mod rule_redirects;

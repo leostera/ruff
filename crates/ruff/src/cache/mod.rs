@@ -8,7 +8,11 @@
 //! - A file's result is used only under a key covering the build, the command, the settings the
 //!   file is checked or formatted with, its permissions (which `ruff check`'s `EXE` rules read),
 //!   and everything else the result depends on besides the file's path and content (for
-//!   `ruff check`, its package root).
+//!   `ruff check`, its package root), and only while the answers to the questions checking the
+//!   package's files asked of the file system (`isort`'s, finding first-party modules) are the
+//!   same. Those are kept once per package and rechecked once per run: they're the same for most
+//!   files, and change only when a module appears or disappears where `isort` looks, when every
+//!   result of the package is dropped.
 //! - A file's `stat` is trusted only outside its racy window; a file whose `stat` changed is read
 //!   and keeps its result if its content didn't change.
 //! - The cache never changes an answer by failing: anything unreadable is a miss, and anything
@@ -37,9 +41,10 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
 use ruff_cache::{CacheKey, CacheKeyHasher};
-use ruff_file_cache::{BuildId, Cache, CacheDir, Digest, Retention, Stat, Timestamp};
+use ruff_file_cache::{BuildId, Cache, CacheDir, Digest, Question, Retention, Stat, Timestamp};
 use ruff_linter::VERSION;
 use ruff_linter::package::PackageRoot;
+use ruff_linter::probes::{self, Probe};
 use ruff_linter::source_kind::{SourceError, SourceKind};
 use ruff_python_ast::SourceType;
 use ruff_workspace::Settings;
@@ -230,7 +235,15 @@ impl<'a, R: Verdict> PackageCaches<'a, R> {
         let relative = path.strip_prefix(&package.root).ok()?;
         let stat = Stat::of_target(path)?;
         let settings = self.settings.get(settings)?;
-        let key = Digest::of(&(package.build, R::COMMAND, settings, stat.mode(), extra));
+        let generation = package.cache.generation();
+        let key = Digest::of(&(
+            package.build,
+            R::COMMAND,
+            settings,
+            stat.mode(),
+            extra,
+            generation,
+        ));
         Some(CachedFile {
             cache: &package.cache,
             path: relative.to_path_buf(),
@@ -285,6 +298,22 @@ impl<R: Verdict> CachedFile<'_, R> {
         if let Some(stat) = Stat::of_target(absolute) {
             self.cache.put(&self.path, self.key, stat, content, result);
         }
+    }
+}
+
+impl CachedFile<'_, Clean> {
+    /// Puts the file as clean, read as `content`, while `probes`, the questions checking it asked
+    /// of the file system, get the same answers.
+    pub(crate) fn put_clean(&self, content: Digest, probes: &[Probe]) {
+        let shared = self.cache.shared();
+        for probe in probes {
+            let question = match probe.question {
+                probes::Question::IsDir => Question::IsDir,
+                probes::Question::IsFile => Question::IsFile,
+            };
+            shared.answer(&probe.path, question, probe.answer);
+        }
+        self.put(content, Clean);
     }
 }
 
@@ -451,6 +480,42 @@ mod tests {
             caches.persist();
             result
         }
+    }
+
+    #[test]
+    fn a_clean_file_is_checked_again_when_isort_would_find_a_module_elsewhere() {
+        let mut package = TestPackage::new(vec![Rule::UnsortedImports]);
+        let src = package.root.join("src");
+        fs::create_dir_all(&src).unwrap();
+        let settings = &mut package.root_settings.resolved.settings;
+        settings.linter.src = vec![src.clone()];
+        // Both third-party, and sorted: until `foo` is first-party, which goes in its own section.
+        let path = package.write("main.py", "import bar\nimport foo\n");
+
+        assert!(
+            package
+                .lint(&[&path], TestPackage::later())
+                .inner
+                .is_empty()
+        );
+        assert!(package.known_clean_by_stat(&path));
+
+        fs::create_dir(src.join("foo")).unwrap();
+        assert!(!package.known_clean_by_stat(&path));
+        let diagnostics = package.lint(&[&path], TestPackage::later());
+        assert_eq!(diagnostics.inner.len(), 1, "{diagnostics:?}");
+
+        fs::remove_dir(src.join("foo")).unwrap();
+        fs::write(src.join("foo.py"), "").unwrap();
+        assert_eq!(package.lint(&[&path], TestPackage::later()).inner.len(), 1);
+        fs::remove_file(src.join("foo.py")).unwrap();
+        assert!(
+            package
+                .lint(&[&path], TestPackage::later())
+                .inner
+                .is_empty()
+        );
+        assert!(package.known_clean_by_stat(&path));
     }
 
     #[test_case("../ruff_linter/resources/test/fixtures/pyflakes"; "pyflakes_fixtures")]

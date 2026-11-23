@@ -1,13 +1,14 @@
 //! What a run read, recorded so that a later run can tell whether it would read the same:
 //! by `stat` and, when that changed, by content.
 
+use std::ffi::OsStr;
 use std::fs;
 use std::io::{self, Read as _};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use rayon::prelude::*;
-use rustc_hash::FxHashSet;
+use rustc_hash::{FxHashMap, FxHashSet};
 use serde::{Deserialize, Serialize};
 
 use crate::Shared;
@@ -42,6 +43,98 @@ enum Read {
     IsDir,
     /// A file whose existence, not content, was read (a path argument).
     IsFile,
+    /// A question asked of a path, and its answer.
+    Answer {
+        /// What was asked.
+        question: Question,
+        /// What the answer was.
+        answer: bool,
+    },
+    /// Entries of a directory looked at, by name, and their kinds. They keep their kinds while
+    /// the directory's `stat` holds, as an entry can't appear, go or change kind without changing
+    /// it: many are checked by one `stat`.
+    Entries {
+        /// The directory's `stat`, taken before any of the entries was looked at.
+        seen: Observation,
+        /// The entries' names and kinds, by name.
+        entries: Vec<(Box<str>, Kind)>,
+    },
+}
+
+/// What kind of entry a directory has under a name, not following symbolic links.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+enum Kind {
+    /// No entry.
+    Missing,
+    /// A regular file.
+    File,
+    /// A directory.
+    Dir,
+}
+
+impl Kind {
+    /// Returns the kind of entry at `path`, or `None` for one its directory's `stat` can't vouch
+    /// for: a symbolic link, whose target can change, a special file, or one that can't be read.
+    fn of(path: &Path) -> Option<Self> {
+        match fs::symlink_metadata(path) {
+            Ok(meta) if meta.is_file() => Some(Self::File),
+            Ok(meta) if meta.is_dir() => Some(Self::Dir),
+            Ok(_) => None,
+            Err(err) if err.kind() == io::ErrorKind::NotFound => Some(Self::Missing),
+            Err(_) => None,
+        }
+    }
+
+    /// Returns the answer to `question` for an entry of this kind.
+    fn answers(self, question: Question) -> bool {
+        match question {
+            Question::IsDir => self == Self::Dir,
+            Question::IsFile => self == Self::File,
+        }
+    }
+}
+
+/// A question a run asked of a path, as the standard library asks it: following symbolic links.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum Question {
+    /// [`Path::is_dir`].
+    IsDir,
+    /// [`Path::is_file`].
+    IsFile,
+}
+
+impl Question {
+    /// Returns the answer for `path`, now.
+    fn ask(self, path: &Path) -> bool {
+        match self {
+            Self::IsDir => path.is_dir(),
+            Self::IsFile => path.is_file(),
+        }
+    }
+}
+
+impl Read {
+    /// Returns whether this and `other` learned the same, if at different times.
+    fn same_as(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Listing(a), Self::Listing(b)) => a.stat() == b.stat(),
+            (
+                Self::Content { seen, digest },
+                Self::Content {
+                    seen: other_seen,
+                    digest: other_digest,
+                },
+            ) => seen.stat() == other_seen.stat() && digest == other_digest,
+            (
+                Self::Entries { seen, entries },
+                Self::Entries {
+                    seen: other_seen,
+                    entries: other_entries,
+                },
+            ) => seen.stat() == other_seen.stat() && entries == other_entries,
+            _ => self == other,
+        }
+    }
 }
 
 impl Input {
@@ -83,6 +176,23 @@ impl Input {
             // Followed: recorded where a file was looked for, which follows symlinks too.
             Read::IsDir => fs::metadata(path).is_ok_and(|meta| meta.is_dir()),
             Read::IsFile => fs::symlink_metadata(path).is_ok_and(|meta| meta.is_file()),
+            Read::Answer { question, answer } => question.ask(path) == *answer,
+            Read::Entries { seen, entries } => {
+                // The directory's `stat` first, so that an entry changed after it shows next time.
+                let stat = Stat::of_path(path)?;
+                if seen.holds_for(&stat) {
+                    true
+                } else {
+                    let same = entries
+                        .iter()
+                        .all(|(name, kind)| Kind::of(&path.join(&**name)) == Some(*kind));
+                    return same.then(|| {
+                        let seen = Observation::new(stat, now);
+                        let entries = entries.clone();
+                        Self::new(path, Read::Entries { seen, entries })
+                    });
+                }
+            }
             Read::Listing(seen) => Stat::of_path(path).is_some_and(|stat| seen.holds_for(&stat)),
             Read::Content { seen, digest } => {
                 if Stat::of_target(path).is_some_and(|stat| seen.holds_for(&stat)) {
@@ -105,17 +215,31 @@ pub struct Inputs(Vec<Input>);
 impl Inputs {
     /// Returns these inputs as they read now, checked in parallel, if they all read the same.
     pub fn recheck(&self, now: Timestamp) -> Option<Self> {
-        self.0
-            .par_iter()
-            .map(|input| {
-                let checked = input.recheck(now);
-                if checked.is_none() {
-                    tracing::debug!("Cache input changed: {}", input.path.display());
-                }
-                checked
-            })
-            .collect::<Option<Vec<_>>>()
-            .map(Self)
+        let recheck = |input: &Input| {
+            let checked = input.recheck(now);
+            if checked.is_none() {
+                tracing::debug!("Cache input changed: {}", input.path.display());
+            }
+            checked
+        };
+        // Few inputs are checked faster than they're handed to other threads.
+        if self.0.len() < Self::PARALLEL {
+            self.0.iter().map(recheck).collect::<Option<_>>().map(Self)
+        } else {
+            self.0
+                .par_iter()
+                .map(recheck)
+                .collect::<Option<_>>()
+                .map(Self)
+        }
+    }
+
+    /// How many inputs are worth rechecking in parallel.
+    const PARALLEL: usize = 64;
+
+    /// Returns whether no input was recorded.
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
     }
 
     /// Returns a digest of what these inputs read, not of when: the same for as long as they
@@ -129,6 +253,8 @@ impl Inputs {
             Missing,
             IsDir,
             IsFile,
+            Answer(Question, bool),
+            Entries(&'a [(Box<str>, Kind)]),
         }
         let seen: Vec<(&Path, Seen<'_>)> = self
             .0
@@ -140,11 +266,60 @@ impl Inputs {
                     Read::Missing => Seen::Missing,
                     Read::IsDir => Seen::IsDir,
                     Read::IsFile => Seen::IsFile,
+                    Read::Answer { question, answer } => Seen::Answer(*question, *answer),
+                    Read::Entries { entries, .. } => Seen::Entries(entries),
                 };
                 (input.path.as_path(), seen)
             })
             .collect();
         Digest::of(&seen)
+    }
+
+    /// Returns these inputs and `newer`, recorded since: what both learned the same once, as
+    /// `newer` learned it.
+    #[must_use]
+    pub fn union(self, newer: Self) -> Self {
+        if self.0.is_empty() {
+            return newer;
+        }
+        let mut inputs = self.0;
+        inputs.extend(newer.0);
+        inputs.sort_by(|a, b| a.path.cmp(&b.path));
+        let mut union: Vec<Input> = Vec::with_capacity(inputs.len());
+        for input in inputs {
+            let same_path = union
+                .iter()
+                .rposition(|kept| kept.path != input.path)
+                .map_or(0, |last_other| last_other + 1);
+            if let Some(kept) = union[same_path..]
+                .iter_mut()
+                .find(|kept| kept.read.same_as(&input.read))
+            {
+                *kept = input;
+                continue;
+            }
+            // Entries of a directory seen with the same `stat` are one: of a directory unchanged
+            // in between.
+            if let Read::Entries { seen, entries } = &input.read && let Some(Read::Entries {
+                seen: kept_seen,
+                entries: kept,
+            }) = union[same_path..]
+                .iter_mut()
+                .map(|kept| &mut kept.read)
+                .find(
+                    |kept| matches!(kept, Read::Entries { seen: s, .. } if s.stat() == seen.stat()),
+                )
+            {
+                *kept_seen = *seen;
+                kept.extend(entries.iter().cloned());
+                // A name seen as two kinds stays twice: one won't read the same, as it should.
+                kept.sort();
+                kept.dedup();
+                continue;
+            }
+            union.push(input);
+        }
+        Self(union)
     }
 
     /// Returns the paths these inputs read, in order.
@@ -162,6 +337,32 @@ enum Look {
     File,
     /// What kind of entry it is: [`Recorder::kind`].
     Kind,
+    /// A question asked of it: [`Recorder::answer`].
+    Answer(Question),
+}
+
+/// A directory whose entries a [`Recorder`] looked at.
+#[derive(Debug)]
+enum Dir {
+    /// A directory, `stat`-ed before any of its entries was looked at, and those entries.
+    Seen {
+        /// Its `stat`.
+        seen: Observation,
+        /// The entries looked at, and their kinds.
+        entries: FxHashMap<Box<str>, Kind>,
+    },
+    /// Missing: so are its entries, while it is.
+    Missing,
+    /// A symbolic link or a special file, whose `stat` can't vouch for entries.
+    Unusable,
+}
+
+/// What a [`Dir`] is, without its entries.
+#[derive(Debug, Clone, Copy)]
+enum DirState {
+    Seen,
+    Missing,
+    Unusable,
 }
 
 /// Records what a run reads, from any of its threads.
@@ -173,6 +374,8 @@ pub struct Recorder {
     inputs: Shared<Vec<Input>>,
     /// The paths recorded, by how: each is recorded once, however many threads look at it.
     seen: Shared<FxHashSet<(Look, PathBuf)>>,
+    /// The directories whose entries were recorded through their `stat`, and those entries.
+    dirs: Shared<FxHashMap<PathBuf, Dir>>,
     /// Set when something can't be recorded faithfully: the recording is then not kept.
     unusable: AtomicBool,
 }
@@ -184,6 +387,7 @@ impl Recorder {
             now,
             inputs: Shared::default(),
             seen: Shared::default(),
+            dirs: Shared::default(),
             unusable: AtomicBool::new(false),
         }
     }
@@ -252,6 +456,66 @@ impl Recorder {
         }
     }
 
+    /// Records the `answer` to a `question` the run asked of `path`. The answer is the run's own,
+    /// not asked again: whatever happens to `path` meanwhile, the run's result follows from it.
+    ///
+    /// Where the answer follows from what kind of entry `path` is (it's missing, or a file or a
+    /// directory, not a symbolic link), that's recorded instead, through its directory's `stat`:
+    /// the answers of most paths in a directory are then checked by one `stat`.
+    pub fn answer(&self, path: &Path, question: Question, answer: bool) {
+        if self.first(Look::Answer(question), path)
+            && !self.entry(path, &|kind| kind.answers(question) == answer)
+        {
+            self.push(Input::new(path, Read::Answer { question, answer }));
+        }
+    }
+
+    /// Records the kind of entry at `path` through its directory's `stat`, if it `fits`. Returns
+    /// whether it did. An entry whose directory is missing is recorded as its directory is.
+    fn entry(&self, path: &Path, fits: &dyn Fn(Kind) -> bool) -> bool {
+        let (Some(dir), Some(name)) = (path.parent(), path.file_name().and_then(OsStr::to_str))
+        else {
+            return false;
+        };
+        // The directory's `stat` before the entry's: an entry can't then change unseen.
+        match self.dir_state(dir) {
+            DirState::Seen => {}
+            DirState::Missing => {
+                return fits(Kind::Missing) && self.entry(dir, &|kind| kind == Kind::Missing);
+            }
+            DirState::Unusable => return false,
+        }
+        let Some(kind) = Kind::of(path).filter(|kind| fits(*kind)) else {
+            return false;
+        };
+        let mut dirs = self.dirs.lock();
+        let Some(Dir::Seen { entries, .. }) = dirs.get_mut(dir) else {
+            return false;
+        };
+        // Seen as another kind before, from another question: the answers are recorded as such.
+        *entries.entry(name.into()).or_insert(kind) == kind
+    }
+
+    /// Returns what the directory at `path` is, `stat`-ing it the first time.
+    fn dir_state(&self, path: &Path) -> DirState {
+        let mut dirs = self.dirs.lock();
+        let dir =
+            dirs.entry(path.to_path_buf())
+                .or_insert_with(|| match fs::symlink_metadata(path) {
+                    Ok(meta) if meta.is_dir() => Dir::Seen {
+                        seen: Observation::new(Stat::of(&meta), self.now),
+                        entries: FxHashMap::default(),
+                    },
+                    Err(err) if err.kind() == io::ErrorKind::NotFound => Dir::Missing,
+                    _ => Dir::Unusable,
+                });
+        match dir {
+            Dir::Seen { .. } => DirState::Seen,
+            Dir::Missing => DirState::Missing,
+            Dir::Unusable => DirState::Unusable,
+        }
+    }
+
     /// Records a file only if it's there: for files whose appearance the enclosing directory's
     /// recorded listing shows.
     pub fn file_if_present(&self, path: &Path) {
@@ -266,6 +530,20 @@ impl Recorder {
             return None;
         }
         let mut inputs = self.inputs.into_inner();
+        inputs.extend(
+            self.dirs
+                .into_inner()
+                .into_iter()
+                .filter_map(|(path, dir)| {
+                    let Dir::Seen { seen, entries } = dir else {
+                        return None;
+                    };
+                    let mut entries: Vec<_> = entries.into_iter().collect();
+                    entries.sort();
+                    (!entries.is_empty())
+                        .then(|| Input::new(&path, Read::Entries { seen, entries }))
+                }),
+        );
         inputs.sort_by(|a, b| a.path.cmp(&b.path));
         Some(Inputs(inputs))
     }
@@ -355,6 +633,125 @@ mod tests {
     }
 
     #[test]
+    fn an_answer_holds_until_the_question_is_answered_otherwise() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("pkg");
+        let module = tmp.path().join("pkg.py");
+        let inputs = record(|r| {
+            r.answer(&dir, Question::IsDir, false);
+            r.answer(&module, Question::IsFile, false);
+        });
+        assert!(inputs.recheck(later()).is_some());
+        fs::write(&module, "").unwrap();
+        assert!(inputs.recheck(later()).is_none());
+        fs::remove_file(&module).unwrap();
+        fs::create_dir(&dir).unwrap();
+        assert!(inputs.recheck(later()).is_none());
+        let answered = record(|r| r.answer(&dir, Question::IsDir, true));
+        assert!(answered.recheck(later()).is_some());
+        assert_ne!(answered.fingerprint(), inputs.fingerprint());
+    }
+
+    #[test]
+    fn a_union_keeps_each_read_once() {
+        let tmp = tempfile::tempdir().unwrap();
+        let file = tmp.path().join("f");
+        fs::write(&file, "x").unwrap();
+        let (a, b) = (tmp.path().join("a"), tmp.path().join("b"));
+        let older = record(|r| {
+            r.file(&file);
+            r.answer(&a, Question::IsDir, false);
+            r.answer(&a, Question::IsFile, false);
+        });
+        let newer = record(|r| {
+            r.file(&file);
+            r.answer(&b, Question::IsDir, false);
+        });
+        let union = older.clone().union(newer.clone());
+        // The file once, and the directory's entries `a` and `b`, seen with the same `stat`.
+        assert_eq!(union.0.len(), 2, "{union:#?}");
+        assert!(matches!(&union.0[0].read, Read::Entries { entries, .. } if entries.len() == 2));
+        assert_eq!(union.clone().union(older).union(newer), union);
+        assert_eq!(Inputs::default().union(union.clone()), union);
+    }
+
+    #[test]
+    fn entries_are_checked_through_their_directory() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        let inputs = record(|r| {
+            r.answer(&dir.join("pkg"), Question::IsDir, false);
+            r.answer(&dir.join("pkg.py"), Question::IsFile, false);
+            // Under a missing directory: recorded as the directory is.
+            r.answer(&dir.join("src/pkg"), Question::IsDir, false);
+        });
+        assert_eq!(inputs.0.len(), 1, "one directory: {inputs:#?}");
+        assert!(matches!(&inputs.0[0].read, Read::Entries { entries, .. } if entries.len() == 3));
+        assert_eq!(inputs.recheck(later()), Some(inputs.clone()));
+
+        // Another entry: the directory changed, its entries looked at hold, and it's refreshed.
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        fs::write(dir.join("other.py"), "").unwrap();
+        let refreshed = inputs.recheck(later()).unwrap();
+        assert_ne!(refreshed, inputs);
+        assert_eq!(refreshed.fingerprint(), inputs.fingerprint());
+
+        fs::create_dir(dir.join("src")).unwrap();
+        assert!(inputs.recheck(later()).is_none());
+        fs::remove_dir(dir.join("src")).unwrap();
+        fs::write(dir.join("pkg.py"), "").unwrap();
+        assert!(inputs.recheck(later()).is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_symbolic_link_is_asked_again() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (targets, links) = (tmp.path().join("targets"), tmp.path().join("links"));
+        fs::create_dir_all(&targets).unwrap();
+        fs::create_dir_all(&links).unwrap();
+        let (to_dir, to_file) = (targets.join("dir"), targets.join("file"));
+        fs::create_dir(&to_dir).unwrap();
+        fs::write(&to_file, "").unwrap();
+        std::os::unix::fs::symlink(&to_dir, links.join("dir")).unwrap();
+        std::os::unix::fs::symlink(&to_file, links.join("file")).unwrap();
+        let inputs = record(|r| {
+            r.answer(&links.join("dir"), Question::IsDir, true);
+            r.answer(&links.join("file"), Question::IsFile, true);
+        });
+        assert!(
+            inputs
+                .0
+                .iter()
+                .all(|input| matches!(input.read, Read::Answer { .. })),
+            "{inputs:#?}"
+        );
+        // The targets swapped kinds: the links' directory didn't change, the answers did.
+        fs::remove_file(&to_file).unwrap();
+        fs::create_dir(&to_file).unwrap();
+        assert!(inputs.recheck(later()).is_none());
+        fs::remove_dir(&to_file).unwrap();
+        fs::write(&to_file, "").unwrap();
+        assert!(inputs.recheck(later()).is_some());
+        fs::remove_dir(&to_dir).unwrap();
+        fs::write(&to_dir, "").unwrap();
+        assert!(inputs.recheck(later()).is_none());
+    }
+
+    #[test]
+    fn a_path_that_changes_kind_during_a_run_isnt_vouched_for_by_its_directory() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("module.py");
+        let recorder = Recorder::new(later());
+        recorder.answer(&path, Question::IsFile, false);
+        fs::write(&path, "").unwrap();
+        recorder.answer(&path, Question::IsDir, false);
+        let inputs = recorder.finish().unwrap();
+        // The run answered `is_file` with `false`: it must be asked again, and now differs.
+        assert!(inputs.recheck(later()).is_none(), "{inputs:#?}");
+    }
+
+    #[test]
     fn a_racy_directory_is_not_trusted() {
         let tmp = tempfile::tempdir().unwrap();
         let recorder = Recorder::new(Timestamp::now());
@@ -396,6 +793,11 @@ mod tests {
             dir: usize,
             name: usize,
         },
+        /// The entry replaced by a directory: another kind, under the same name.
+        MakeDir {
+            dir: usize,
+            name: usize,
+        },
     }
 
     use quickcheck::Arbitrary;
@@ -404,7 +806,7 @@ mod tests {
         fn arbitrary(g: &mut quickcheck::Gen) -> Self {
             let mut pick = |n: usize| usize::arbitrary(g) % n;
             let (dir, name, other) = (pick(DIRS.len()), pick(NAMES.len()), pick(NAMES.len()));
-            match pick(6) {
+            match pick(7) {
                 0 => Self::Write {
                     dir,
                     name,
@@ -418,6 +820,7 @@ mod tests {
                     to: other,
                 },
                 4 => Self::Touch { dir },
+                5 => Self::MakeDir { dir, name },
                 _ => Self::Chmod { dir, name },
             }
         }
@@ -452,6 +855,11 @@ mod tests {
                     let path = root.join(DIRS[dir]).join("touch.tmp");
                     fs::write(&path, "").unwrap();
                     fs::remove_file(&path).unwrap();
+                }
+                Self::MakeDir { dir, name } => {
+                    let path = at(dir, name);
+                    let _ = fs::remove_file(&path);
+                    let _ = fs::create_dir(&path);
                 }
                 Self::Chmod { dir, name } => {
                     let path = at(dir, name);
@@ -489,6 +897,14 @@ mod tests {
                 Ok(_) => "file".into(),
                 Err(_) => "missing".into(),
             },
+            Read::Answer { question, .. } => format!("{question:?} {}", question.ask(path)),
+            Read::Entries { entries, .. } => {
+                let kinds: Vec<_> = entries
+                    .iter()
+                    .map(|(name, _)| Kind::of(&path.join(&**name)))
+                    .collect();
+                format!("entries {kinds:?}")
+            }
         }
     }
 
@@ -513,8 +929,13 @@ mod tests {
                 for dir in DIRS {
                     recorder.dir(&root.join(dir));
                     for name in NAMES {
-                        recorder.file(&root.join(dir).join(name));
-                        recorder.kind(&root.join(dir).join(name));
+                        let path = root.join(dir).join(name);
+                        recorder.file(&path);
+                        recorder.kind(&path);
+                        recorder.answer(&path, Question::IsDir, path.is_dir());
+                        recorder.answer(&path, Question::IsFile, path.is_file());
+                        let under = path.join("module");
+                        recorder.answer(&under, Question::IsFile, under.is_file());
                     }
                 }
             });

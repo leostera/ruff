@@ -6,6 +6,12 @@
 //! path and content: the tool's build and settings, and the
 //! [fingerprint](crate::Inputs::fingerprint) of anything else it read. A result that can't be
 //! keyed so mustn't be put.
+//!
+//! What results depend on but is only known once they're computed, and is the same for most of
+//! them, is recorded once for the whole cache instead: its [shared inputs](Cache::shared). The
+//! results hold while those read the same, rechecked once per run; when one doesn't, every
+//! result of the cache is dropped. The cache's [generation](Cache::generation), which the caller
+//! puts in its keys, changes then, so that results put in the store before aren't found either.
 
 use std::fmt;
 use std::path::Path;
@@ -20,6 +26,7 @@ use serde::{Deserialize, Serialize};
 use crate::Shared;
 use crate::digest::Digest;
 use crate::dir::CacheDir;
+use crate::inputs::{Inputs, Recorder};
 use crate::stat::{Observation, Stat, Timestamp};
 
 /// A file's result, as a run put it.
@@ -35,6 +42,17 @@ pub struct Entry<R> {
     pub content: Digest,
     /// What the caller computed for that content, under that key.
     pub result: R,
+}
+
+/// A cache as a run saves it.
+#[derive(Serialize, Deserialize)]
+struct Saved<E> {
+    /// The generation the entries were put in.
+    generation: Digest,
+    /// What every entry depends on besides what its key covers.
+    shared: Inputs,
+    /// The entries, by path.
+    entries: Vec<E>,
 }
 
 /// One of the last run's entries.
@@ -61,6 +79,12 @@ pub struct Cache<R> {
     /// This run's entries but those [kept](Last::kept) by `stat`: with the kept ones, what the
     /// next run reads as its `last`.
     found: Shared<Vec<Entry<R>>>,
+    /// Identifies the shared inputs the entries depend on: it changes when one reads otherwise.
+    generation: Digest,
+    /// The last run's shared inputs, which read the same now, as rechecked.
+    last_shared: Inputs,
+    /// The shared inputs this run's results depend on.
+    shared: Recorder,
 }
 
 impl<R> fmt::Debug for Cache<R> {
@@ -77,7 +101,20 @@ impl<R: Clone + Serialize + DeserializeOwned> Cache<R> {
     /// started at `started`: before it read any file.
     pub fn open(dir: Arc<CacheDir>, name: impl Into<String>, started: Timestamp) -> Self {
         let name = name.into();
-        let last: Vec<Entry<R>> = dir.read(&name).unwrap_or_default();
+        let saved: Option<Saved<Entry<R>>> = dir.read(&name);
+        let previous = saved.as_ref().map(|saved| saved.generation);
+        let (generation, last_shared, last) = match saved.and_then(|saved| {
+            let shared = saved.shared.recheck(started)?;
+            Some((saved.generation, shared, saved.entries))
+        }) {
+            Some(last) => last,
+            // A new generation, unlike any before it.
+            None => (
+                Digest::of(&(&name, started, previous)),
+                Inputs::default(),
+                Vec::new(),
+            ),
+        };
         Self {
             last: last
                 .into_iter()
@@ -94,7 +131,20 @@ impl<R: Clone + Serialize + DeserializeOwned> Cache<R> {
             started,
             keep_unvisited: Duration::ZERO,
             found: Shared::default(),
+            generation,
+            last_shared,
+            shared: Recorder::new(started),
         }
+    }
+
+    /// Returns the generation of the shared inputs: the caller puts it in its keys.
+    pub fn generation(&self) -> Digest {
+        self.generation
+    }
+
+    /// Returns where to record the shared inputs of this run's results.
+    pub fn shared(&self) -> &Recorder {
+        &self.shared
     }
 
     /// Keeps the entries of files this run didn't look up for `age` after they were last put,
@@ -159,6 +209,18 @@ impl<R: Clone + Serialize + DeserializeOwned> Cache<R> {
     /// Saves this run's results, unless they're the last run's. Results added to the store are
     /// written when the directory [commits](CacheDir::commit) it.
     pub fn save(self) {
+        // Results that depend on what couldn't be recorded can't be kept, nor can those in the
+        // store under this generation: the next run starts a new one.
+        let Some(shared) = self.shared.finish() else {
+            let saved = Saved::<Entry<R>> {
+                generation: Digest::of(&(&self.name, self.started, self.generation)),
+                shared: Inputs::default(),
+                entries: Vec::new(),
+            };
+            self.dir.write(&self.name, &saved);
+            return;
+        };
+        let shared = self.last_shared.clone().union(shared);
         let found = self.found.into_inner();
         let found_paths: FxHashSet<&str> = found.iter().map(|entry| &*entry.path).collect();
         let unvisited_since = self.started - self.keep_unvisited;
@@ -175,14 +237,20 @@ impl<R: Clone + Serialize + DeserializeOwned> Cache<R> {
             .map(|last| &last.entry)
             .filter(|entry| !found_paths.contains(&*entry.path))
             .collect();
-        // Nothing found and nothing dropped: the last run's entries, as they are.
-        if found.is_empty() && retained.len() == self.last.len() {
+        // Nothing found, nothing dropped and nothing else depended on: the last run's entries,
+        // as they are.
+        if found.is_empty() && retained.len() == self.last.len() && shared == self.last_shared {
             return;
         }
         let mut entries: Vec<&Entry<R>> = retained.into_iter().chain(&found).collect();
         entries.sort_unstable_by(|a, b| a.path.cmp(&b.path));
         entries.dedup_by(|a, b| a.path == b.path);
-        self.dir.write(&self.name, &entries);
+        let saved = Saved {
+            generation: self.generation,
+            shared,
+            entries,
+        };
+        self.dir.write(&self.name, &saved);
     }
 
     /// Returns a result's key in the store, shared by every cache in the directory: the caller's
@@ -368,6 +436,63 @@ mod tests {
         assert_eq!(cache.get_by_stat(&f, Digest::of(&1), stat), Some(1));
         cache.save();
         assert_eq!(fs::metadata(&written).unwrap().modified().unwrap(), old);
+    }
+
+    #[test]
+    fn results_hold_while_their_shared_inputs_read_the_same() {
+        use crate::Question;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let f = tmp.path().join("f");
+        let module = tmp.path().join("module.py");
+        fs::write(&f, "x").unwrap();
+        let stat = Stat::of_path(&f).unwrap();
+        let content = Digest::of_bytes(b"x");
+        let later = Timestamp::now() + Duration::from_secs(10);
+        let dir = Arc::new(CacheDir::open(&tmp.path().join("cache")).unwrap());
+        let key = |cache: &Cache<u8>| Digest::of(&(1, cache.generation()));
+
+        let cache = Cache::open(Arc::clone(&dir), "files", later);
+        cache.put(&f, key(&cache), stat, content, 1u8);
+        cache.shared().answer(&module, Question::IsFile, false);
+        cache.save();
+        dir.commit(Retention::default());
+
+        let cache = Cache::<u8>::open(Arc::clone(&dir), "files", later);
+        assert_eq!(cache.get_by_stat(&f, key(&cache), stat), Some(1));
+        cache.save();
+
+        // An answer changes: every result goes, the store's too, and a new generation starts.
+        fs::write(&module, "").unwrap();
+        let cache = Cache::<u8>::open(Arc::clone(&dir), "files", later);
+        assert_eq!(cache.get_by_stat(&f, key(&cache), stat), None);
+        assert_eq!(cache.get_by_content(&f, key(&cache), stat, content), None);
+        cache.put(&f, key(&cache), stat, content, 2u8);
+        cache.save();
+        let cache = Cache::<u8>::open(Arc::clone(&dir), "files", later);
+        assert_eq!(cache.get_by_stat(&f, key(&cache), stat), Some(2));
+    }
+
+    #[test]
+    fn results_whose_shared_inputs_cant_be_recorded_arent_kept() {
+        let tmp = tempfile::tempdir().unwrap();
+        let f = tmp.path().join("f");
+        fs::write(&f, "x").unwrap();
+        let stat = Stat::of_path(&f).unwrap();
+        let content = Digest::of_bytes(b"x");
+        let later = Timestamp::now() + Duration::from_secs(10);
+        let dir = Arc::new(CacheDir::open(&tmp.path().join("cache")).unwrap());
+        let key = |cache: &Cache<u8>| Digest::of(&(1, cache.generation()));
+
+        let cache = Cache::open(Arc::clone(&dir), "files", later);
+        cache.put(&f, key(&cache), stat, content, 1u8);
+        cache.shared().mark_unrecordable(&f);
+        cache.save();
+        dir.commit(Retention::default());
+
+        let cache = Cache::<u8>::open(Arc::clone(&dir), "files", later);
+        assert_eq!(cache.get_by_stat(&f, key(&cache), stat), None);
+        assert_eq!(cache.get_by_content(&f, key(&cache), stat, content), None);
     }
 
     #[test]

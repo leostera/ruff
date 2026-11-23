@@ -9,6 +9,7 @@ use serde::{Deserialize, Serialize};
 use strum_macros::EnumIter;
 
 use crate::package::PackageRoot;
+use crate::probes::Probes;
 use crate::settings::types::IdentifierPattern;
 use crate::warn_user_once;
 use ruff_macros::CacheKey;
@@ -172,12 +173,12 @@ fn match_sources<'a>(paths: &'a [PathBuf], name: &str) -> Option<&'a Path> {
     relative_path.components().next()?;
     for root in paths {
         let candidate = root.join(&relative_path);
-        if candidate.is_dir() {
+        if Probes::is_dir(&candidate) {
             return Some(root);
         }
         if ["py", "pyi"]
             .into_iter()
-            .any(|extension| candidate.with_extension(extension).is_file())
+            .any(|extension| Probes::is_file(&candidate.with_extension(extension)))
         {
             return Some(root);
         }

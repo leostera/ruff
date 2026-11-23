@@ -15,6 +15,7 @@ use ruff_linter::codes::Rule;
 use ruff_linter::linter::{FixTable, FixerResult, LinterResult, ParseSource, lint_fix, lint_only};
 use ruff_linter::package::PackageRoot;
 use ruff_linter::packaging::detect_package_root;
+use ruff_linter::probes::Probes;
 use ruff_linter::settings::types::UnsafeFixes;
 use ruff_linter::settings::{LinterSettings, flags};
 use ruff_linter::source_kind::{SourceError, SourceKind, SourceKindDiff};
@@ -282,7 +283,9 @@ pub(crate) fn lint_path(
         }
     };
 
-    // Lint the file.
+    // Lint the file, recording what linting asks of the file system besides reading it, for the
+    // cache.
+    let probes = cache.as_ref().map(|_| Probes::start());
     let (result, transformed, fixed) =
         if matches!(fix_mode, flags::FixMode::Apply | flags::FixMode::Diff) {
             if let Ok(FixerResult {
@@ -348,6 +351,7 @@ pub(crate) fn lint_path(
         };
 
     let diagnostics = result.diagnostics;
+    let probes = probes.map(Probes::finish).unwrap_or_default();
 
     if let (Some(cache), Some(content)) = (cache, content) {
         // `FixMode::Apply` and `FixMode::Diff` rely on side-effects (writing to disk,
@@ -361,7 +365,7 @@ pub(crate) fn lint_path(
 
         // We don't cache files with diagnostics.
         if diagnostics.is_empty() && use_fixes {
-            cache.put(content, Clean);
+            cache.put_clean(content, &probes);
         }
     }
 

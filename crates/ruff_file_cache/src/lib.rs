@@ -56,7 +56,7 @@ pub use build::BuildId;
 pub use cache::{Cache, Entry};
 pub use digest::Digest;
 pub use dir::CacheDir;
-pub use inputs::{Inputs, Recorder};
+pub use inputs::{Inputs, Question, Recorder};
 pub use stat::{Observation, Stat, Timestamp};
 pub use store::Retention;
 
