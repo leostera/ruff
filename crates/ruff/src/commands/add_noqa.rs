@@ -27,7 +27,8 @@ pub(crate) fn add_noqa(
 ) -> Result<usize> {
     // Collect all the files to check.
     let start = Instant::now();
-    let (mut paths, resolver) = project_files_in_path(files, root_settings, config_arguments)?;
+    let (mut paths, resolver) =
+        project_files_in_path(files, root_settings, config_arguments, None)?;
     let duration = start.elapsed();
     debug!("Identified files to lint in: {duration:?}");
 

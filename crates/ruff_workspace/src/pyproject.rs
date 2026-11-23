@@ -16,6 +16,19 @@ use ruff_linter::settings::types::{PythonVersion, RequiredVersion};
 
 use crate::options::{Options, validate_required_version};
 
+/// Told what settings discovery is about to read, so that the caller can tell whether a later
+/// discovery would read the same (as Ruff's cache does to skip walking the file system).
+///
+/// Each method is called before the read, so that a file changed during the run is recorded as
+/// it was before, and shows as changed to a later run.
+pub trait DiscoveryObserver: Sync {
+    /// Discovery is about to list the directory at `path`, or look for files in it.
+    fn listing(&self, path: &Path);
+
+    /// Discovery is about to read the file at `path`, or look for it.
+    fn reading(&self, path: &Path);
+}
+
 #[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
 struct Tools {
     ruff: Option<Options>,
@@ -33,7 +46,14 @@ pub struct Pyproject {
     project: Option<Project>,
 }
 
-fn parse_toml<T: DeserializeOwned>(path: &Path, table_path: &[&str]) -> Result<T> {
+fn parse_toml<T: DeserializeOwned>(
+    path: &Path,
+    table_path: &[&str],
+    observer: Option<&dyn DiscoveryObserver>,
+) -> Result<T> {
+    if let Some(observer) = observer {
+        observer.reading(path);
+    }
     let _guard = ValueSourceGuard::new(
         ValueSource::File(Arc::new(SystemPathBuf::from_path_buf_lossy(
             path.to_path_buf(),
@@ -64,40 +84,53 @@ fn parse_toml<T: DeserializeOwned>(path: &Path, table_path: &[&str]) -> Result<T
 }
 
 /// Parse a `ruff.toml` file.
-fn parse_ruff_toml(path: &Path) -> Result<Options> {
-    parse_toml(path, &[])
+fn parse_ruff_toml(path: &Path, observer: Option<&dyn DiscoveryObserver>) -> Result<Options> {
+    parse_toml(path, &[], observer)
 }
 
 /// Parse a `pyproject.toml` file.
-fn parse_pyproject_toml(path: &Path) -> Result<Pyproject> {
-    parse_toml(path, &["tool", "ruff"])
+fn parse_pyproject_toml(
+    path: &Path,
+    observer: Option<&dyn DiscoveryObserver>,
+) -> Result<Pyproject> {
+    parse_toml(path, &["tool", "ruff"], observer)
 }
 
 /// Return `true` if a `pyproject.toml` contains a `[tool.ruff]` section.
-fn ruff_enabled<P: AsRef<Path>>(path: P) -> Result<bool> {
-    let pyproject = parse_pyproject_toml(path.as_ref())?;
+fn ruff_enabled(path: &Path, observer: Option<&dyn DiscoveryObserver>) -> Result<bool> {
+    let pyproject = parse_pyproject_toml(path, observer)?;
     Ok(pyproject.tool.and_then(|tool| tool.ruff).is_some())
 }
 
 /// Return the path to the `pyproject.toml` or `ruff.toml` file in a given
-/// directory.
-pub fn settings_toml<P: AsRef<Path>>(path: P) -> Result<Option<PathBuf>> {
+/// directory, telling `observer` about each file looked for.
+pub fn settings_toml<P: AsRef<Path>>(
+    path: P,
+    observer: Option<&dyn DiscoveryObserver>,
+) -> Result<Option<PathBuf>> {
     let path = path.as_ref();
+    let is_file = |path: &Path| {
+        if let Some(observer) = observer {
+            observer.reading(path);
+        }
+        path.is_file()
+    };
+
     // Check for `.ruff.toml`.
     let ruff_toml = path.join(".ruff.toml");
-    if ruff_toml.is_file() {
+    if is_file(&ruff_toml) {
         return Ok(Some(ruff_toml));
     }
 
     // Check for `ruff.toml`.
     let ruff_toml = path.join("ruff.toml");
-    if ruff_toml.is_file() {
+    if is_file(&ruff_toml) {
         return Ok(Some(ruff_toml));
     }
 
     // Check for `pyproject.toml`.
     let pyproject_toml = path.join("pyproject.toml");
-    if pyproject_toml.is_file() && ruff_enabled(&pyproject_toml)? {
+    if is_file(&pyproject_toml) && ruff_enabled(&pyproject_toml, observer)? {
         return Ok(Some(pyproject_toml));
     }
 
@@ -108,7 +141,7 @@ pub fn settings_toml<P: AsRef<Path>>(path: P) -> Result<Option<PathBuf>> {
 /// exists.
 pub fn find_settings_toml<P: AsRef<Path>>(path: P) -> Result<Option<PathBuf>> {
     for directory in path.as_ref().ancestors() {
-        if let Some(pyproject) = settings_toml(directory)? {
+        if let Some(pyproject) = settings_toml(directory, None)? {
             return Ok(Some(pyproject));
         }
     }
@@ -143,10 +176,13 @@ fn check_required_version(value: &toml::de::DeTable, table_path: &[&str]) -> Res
 }
 
 /// Derive target version from `required-version` in `pyproject.toml`, if
-/// such a file exists in an ancestor directory.
-pub fn find_fallback_target_version<P: AsRef<Path>>(path: P) -> Option<PythonVersion> {
+/// such a file exists in an ancestor directory, telling `observer` about each file looked for.
+pub fn find_fallback_target_version<P: AsRef<Path>>(
+    path: P,
+    observer: Option<&dyn DiscoveryObserver>,
+) -> Option<PythonVersion> {
     for directory in path.as_ref().ancestors() {
-        if let Some(fallback) = get_fallback_target_version(directory) {
+        if let Some(fallback) = get_fallback_target_version(directory, observer) {
             return Some(fallback);
         }
     }
@@ -179,10 +215,13 @@ pub fn find_user_settings_toml() -> Option<PathBuf> {
 }
 
 /// Load `Options` from a `pyproject.toml` or `ruff.toml` file.
-pub(super) fn load_options<P: AsRef<Path>>(path: P) -> Result<Options> {
+pub(super) fn load_options<P: AsRef<Path>>(
+    path: P,
+    observer: Option<&dyn DiscoveryObserver>,
+) -> Result<Options> {
     let path = path.as_ref();
     if path.ends_with("pyproject.toml") {
-        let pyproject = parse_pyproject_toml(path)?;
+        let pyproject = parse_pyproject_toml(path, observer)?;
         let mut ruff = pyproject
             .tool
             .and_then(|tool| tool.ruff)
@@ -196,7 +235,7 @@ pub(super) fn load_options<P: AsRef<Path>>(path: P) -> Result<Options> {
         }
         Ok(ruff)
     } else {
-        let ruff = parse_ruff_toml(path);
+        let ruff = parse_ruff_toml(path, observer);
         if let Ok(ruff) = ruff {
             if ruff.target_version.is_none() {
                 debug!("No `target-version` found in `{}`", path.display());
@@ -210,12 +249,18 @@ pub(super) fn load_options<P: AsRef<Path>>(path: P) -> Result<Options> {
 
 /// Extract `target-version` from `pyproject.toml` in the given directory
 /// if the file exists and has `requires-python`.
-fn get_fallback_target_version(dir: &Path) -> Option<PythonVersion> {
+fn get_fallback_target_version(
+    dir: &Path,
+    observer: Option<&dyn DiscoveryObserver>,
+) -> Option<PythonVersion> {
     let pyproject_path = dir.join("pyproject.toml");
+    if let Some(observer) = observer {
+        observer.reading(&pyproject_path);
+    }
     if !pyproject_path.exists() {
         return None;
     }
-    let parsed_pyproject = parse_pyproject_toml(&pyproject_path);
+    let parsed_pyproject = parse_pyproject_toml(&pyproject_path, observer);
 
     let pyproject = match parsed_pyproject {
         Ok(pyproject) => pyproject,
@@ -545,7 +590,7 @@ per-file-ignores = { "__init__.py" = ["F401"] }
 
         let pyproject =
             find_settings_toml(tempdir.path())?.context("Failed to find pyproject.toml")?;
-        let pyproject = parse_pyproject_toml(&pyproject)?;
+        let pyproject = parse_pyproject_toml(&pyproject, None)?;
         let config = pyproject
             .tool
             .context("Expected to find [tool] field")?

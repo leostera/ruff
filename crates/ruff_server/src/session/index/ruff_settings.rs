@@ -85,7 +85,7 @@ impl RuffSettings {
                 .map(RuffSettings)
             })
             .unwrap_or_else(|| {
-                let fallback = find_fallback_target_version(root);
+                let fallback = find_fallback_target_version(root, None);
                 if let Some(fallback) = fallback {
                     tracing::debug!(
                         "Derived `target-version` from found `requires-python` for fallback configuration: {fallback:?}"
@@ -173,7 +173,7 @@ impl RuffSettingsIndex {
         // Add any settings from above the workspace root, skipping the workspace root itself if
         // this is *not* the default workspace.
         for directory in root.ancestors().skip(should_skip_workspace) {
-            match settings_toml(directory) {
+            match settings_toml(directory, None) {
                 Ok(Some(pyproject)) => {
                     match ruff_workspace::resolver::resolve_root_settings(
                         &pyproject,
@@ -300,7 +300,7 @@ impl RuffSettingsIndex {
                     }
                 }
 
-                match settings_toml(&directory) {
+                match settings_toml(&directory, None) {
                     Ok(Some(pyproject)) => {
                         match ruff_workspace::resolver::resolve_root_settings(
                             &pyproject,

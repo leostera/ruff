@@ -107,7 +107,7 @@ pub fn resolve(
         // `pyproject::find_settings_toml`.)
         // However, there may be a `pyproject.toml` with a `requires-python`
         // specified, and that is what we look for in this step.
-        let fallback = find_fallback_target_version(stdin_filename.unwrap_or(&cwd));
+        let fallback = find_fallback_target_version(stdin_filename.unwrap_or(&cwd), None);
         if let Some(version) = fallback {
             debug!("Derived `target-version` from found `requires-python`: {version:?}");
         }

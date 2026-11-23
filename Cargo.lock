@@ -3022,6 +3022,7 @@ dependencies = [
  "mimalloc",
  "notify",
  "path-absolutize",
+ "quickcheck",
  "rayon",
  "regex",
  "ruff_cache",

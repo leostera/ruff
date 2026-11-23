@@ -27,6 +27,7 @@ use ruff_workspace::resolver::{
 };
 
 use crate::args::ConfigArguments;
+use crate::cache::walk::WalkCache;
 use crate::cache::{CachedFile, Clean, PackageCaches};
 use crate::diagnostics::Diagnostics;
 
@@ -45,7 +46,14 @@ pub(crate) fn check(
 
     // Collect all the Python files to check.
     let start = Instant::now();
-    let (mut paths, resolver) = project_files_in_path(files, root_settings, config_arguments)?;
+    let (mut paths, resolver) = match cache
+        .is_enabled()
+        .then(|| WalkCache::open(files, root_settings, started))
+        .flatten()
+    {
+        Some(walk) => walk.project_files(files, root_settings, config_arguments)?,
+        None => project_files_in_path(files, root_settings, config_arguments, None)?,
+    };
     debug!("Identified files to lint in: {:?}", start.elapsed());
 
     // Filter out paths for file types not supported for linting

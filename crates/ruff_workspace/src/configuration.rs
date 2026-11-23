@@ -57,7 +57,7 @@ use crate::options::{
     PydoclintOptions, PydocstyleOptions, PyflakesOptions, PylintOptions, RuffOptions,
     validate_required_version,
 };
-use crate::pyproject;
+use crate::pyproject::{self, DiscoveryObserver};
 use crate::resolver::ConfigurationOrigin;
 use crate::settings::{
     EXCLUDE, FileResolverSettings, FormatterSettings, INCLUDE, INCLUDE_PREVIEW, LineEnding,
@@ -666,6 +666,7 @@ impl Configuration {
         mut self,
         origin: ConfigurationOrigin<'_>,
         initial_config_path: &Path,
+        observer: Option<&dyn DiscoveryObserver>,
     ) -> Self {
         let directory = match origin {
             ConfigurationOrigin::Ancestor if self.target_version.is_none() => {
@@ -676,7 +677,9 @@ impl Configuration {
             ConfigurationOrigin::UserSettings { fallback_directory } => Some(fallback_directory),
             _ => None,
         };
-        if let Some(version) = directory.and_then(pyproject::find_fallback_target_version) {
+        if let Some(version) = directory
+            .and_then(|directory| pyproject::find_fallback_target_version(directory, observer))
+        {
             debug!("Derived `target-version` from `requires-python`: {version:?}");
             self.target_version = Some(version.into());
         }

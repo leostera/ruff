@@ -43,7 +43,8 @@ pub(crate) fn analyze_graph(
 
     // Find all Python files.
     let files = resolve_default_files(args.files, false);
-    let (mut paths, resolver) = project_files_in_path(&files, &root_settings, config_arguments)?;
+    let (mut paths, resolver) =
+        project_files_in_path(&files, &root_settings, config_arguments, None)?;
 
     // Filter to only Python files
     paths.retain(|path| {

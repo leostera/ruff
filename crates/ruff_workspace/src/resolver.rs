@@ -23,7 +23,7 @@ use ruff_linter::package::PackageRoot;
 use ruff_linter::packaging::is_package;
 
 use crate::configuration::Configuration;
-use crate::pyproject::settings_toml;
+use crate::pyproject::{DiscoveryObserver, settings_toml};
 use crate::settings::Settings;
 use crate::{FileResolverSettings, pyproject};
 
@@ -62,8 +62,9 @@ impl PyprojectDiscoveryStrategy {
 #[derive(Debug)]
 pub struct Resolver<'a> {
     root_settings: &'a RootSettings,
-    /// All [`Settings`] that have been added to the resolver, along with their config file paths.
-    settings: Vec<ResolvedSettings>,
+    /// All [`Settings`] that have been added to the resolver, along with their config file paths
+    /// and the directories they were added for, in the order they were added.
+    settings: Vec<(PathBuf, ResolvedSettings)>,
     /// A router from path to index into the `settings` vector.
     router: Router<usize>,
 }
@@ -104,7 +105,7 @@ impl<'a> Resolver<'a> {
 
     /// Add resolved [`Settings`] under the given directory.
     fn add(&mut self, path: &Path, settings: ResolvedSettings) {
-        self.settings.push(settings);
+        self.settings.push((path.to_path_buf(), settings));
 
         // Normalize the path to use `/` separators and escape the '{' and '}' characters,
         // which matchit uses for routing parameters.
@@ -139,7 +140,7 @@ impl<'a> Resolver<'a> {
             PyprojectDiscoveryStrategy::Hierarchical => self
                 .router
                 .at(path.to_slash_lossy().as_ref())
-                .map(|Match { value, .. }| &self.settings[*value])
+                .map(|Match { value, .. }| &self.settings[*value].1)
                 .unwrap_or(&self.root_settings.resolved),
         }
     }
@@ -216,7 +217,37 @@ impl<'a> Resolver<'a> {
     /// Return an iterator over the resolved [`Settings`] in this [`Resolver`].
     pub fn settings(&self) -> impl Iterator<Item = &Settings> {
         std::iter::once(self.root_settings())
-            .chain(self.settings.iter().map(|entry| &entry.settings))
+            .chain(self.settings.iter().map(|(_, entry)| &entry.settings))
+    }
+
+    /// Return the configurations discovery added, besides the root settings: each directory it
+    /// was found for and its settings, in the order discovery added them.
+    pub fn configurations(&self) -> impl Iterator<Item = (&Path, &ResolvedSettings)> {
+        self.settings
+            .iter()
+            .map(|(directory, settings)| (directory.as_path(), settings))
+    }
+
+    /// Add the settings of each configuration file found, with the directory it was found in, as
+    /// discovery adds the configurations it finds in ancestors and traversed directories.
+    pub fn add_configurations<'p>(
+        &mut self,
+        found: impl IntoIterator<Item = (&'p Path, &'p Path)>,
+        transformer: &dyn ConfigurationTransformer,
+    ) -> Result<()> {
+        // Configurations extending the same base parse it once, as in a walk.
+        let configuration_cache = ConfigurationCache::default();
+        for (directory, config_path) in found {
+            let settings = resolve_scoped_settings(
+                config_path,
+                transformer,
+                ConfigurationOrigin::Ancestor,
+                Some(&configuration_cache),
+                None,
+            )?;
+            self.add(directory, settings);
+        }
+        Ok(())
     }
 }
 
@@ -328,7 +359,7 @@ pub fn resolve_configuration(
     initial_config_path: &Path,
     origin: ConfigurationOrigin<'_>,
 ) -> Result<Configuration> {
-    resolve_configuration_with_cache(initial_config_path, origin, None)
+    resolve_configuration_with_cache(initial_config_path, origin, None, None)
         .map(|(_, configuration)| configuration)
 }
 
@@ -336,6 +367,7 @@ fn resolve_configuration_with_cache(
     initial_config_path: &Path,
     origin: ConfigurationOrigin<'_>,
     configuration_cache: Option<&ConfigurationCache>,
+    observer: Option<&dyn DiscoveryObserver>,
 ) -> Result<(PathBuf, Configuration)> {
     let mut configurations = indexmap::IndexMap::new();
     let mut next = Some(fs::normalize_path(initial_config_path));
@@ -353,7 +385,7 @@ fn resolve_configuration_with_cache(
 
         let project_root = origin.project_root(&path);
         let load = || {
-            let options = pyproject::load_options(&path).with_context(|| {
+            let options = pyproject::load_options(&path, observer).with_context(|| {
                 if configurations.is_empty() {
                     format!(
                         "Failed to load configuration `{path}`",
@@ -402,7 +434,7 @@ fn resolve_configuration_with_cache(
 
     Ok((
         config_path,
-        configuration.apply_fallbacks(origin, initial_config_path),
+        configuration.apply_fallbacks(origin, initial_config_path, observer),
     ))
 }
 
@@ -412,9 +444,10 @@ fn resolve_scoped_settings(
     transformer: &dyn ConfigurationTransformer,
     origin: ConfigurationOrigin<'_>,
     configuration_cache: Option<&ConfigurationCache>,
+    observer: Option<&dyn DiscoveryObserver>,
 ) -> Result<ResolvedSettings> {
     let (config_path, configuration) =
-        resolve_configuration_with_cache(pyproject, origin, configuration_cache)?;
+        resolve_configuration_with_cache(pyproject, origin, configuration_cache, observer)?;
     let settings = transformer
         .transform(configuration)
         .into_settings(origin.project_root(pyproject))?;
@@ -428,7 +461,7 @@ pub fn resolve_root_settings(
     transformer: &dyn ConfigurationTransformer,
     origin: ConfigurationOrigin<'_>,
 ) -> Result<ResolvedSettings> {
-    resolve_scoped_settings(pyproject, transformer, origin, None)
+    resolve_scoped_settings(pyproject, transformer, origin, None, None)
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -458,11 +491,13 @@ impl ConfigurationOrigin<'_> {
     }
 }
 
-/// Find all project files in a set of paths, following configured include/exclude settings.
+/// Find all project files in a set of paths, following configured include/exclude settings,
+/// and tell `observer` what the search reads besides what the `ignore` crate reads.
 pub fn project_files_in_path<'a>(
     paths: &[PathBuf],
     root_settings: &'a RootSettings,
     transformer: &(dyn ConfigurationTransformer + Sync),
+    observer: Option<&dyn DiscoveryObserver>,
 ) -> Result<(Vec<Result<ResolvedFile, ignore::Error>>, Resolver<'a>)> {
     // Normalize every path (e.g., convert from relative to absolute).
     let mut paths: Vec<PathBuf> = paths.iter().map(fs::normalize_path).unique().collect();
@@ -481,12 +516,13 @@ pub fn project_files_in_path<'a>(
         for path in &paths {
             for ancestor in path.ancestors() {
                 if seen.insert(ancestor) {
-                    if let Some(pyproject) = settings_toml(ancestor)? {
+                    if let Some(pyproject) = settings_toml(ancestor, observer)? {
                         let settings = resolve_scoped_settings(
                             &pyproject,
                             transformer,
                             ConfigurationOrigin::Ancestor,
                             Some(&configuration_cache),
+                            observer,
                         )?;
                         resolver.add(ancestor, settings);
                         // We found the closest configuration.
@@ -529,7 +565,7 @@ pub fn project_files_in_path<'a>(
     let walker = builder.build_parallel();
 
     // Run the `WalkParallel` to collect all files.
-    let state = WalkPythonFilesState::new(resolver, configuration_cache);
+    let state = WalkPythonFilesState::new(resolver, configuration_cache, observer);
     let mut visitor = PythonFilesVisitorBuilder::new(transformer, &state);
     walker.visit(&mut visitor);
 
@@ -538,20 +574,27 @@ pub fn project_files_in_path<'a>(
 
 type ResolvedFiles = Vec<Result<ResolvedFile, ignore::Error>>;
 
-struct WalkPythonFilesState<'config> {
+struct WalkPythonFilesState<'config, 'observer> {
     is_hierarchical: bool,
     merged: std::sync::Mutex<(ResolvedFiles, Result<()>)>,
     resolver: RwLock<Resolver<'config>>,
     configuration_cache: ConfigurationCache,
+    /// Told about every directory the walk lists and every configuration file it reads.
+    observer: Option<&'observer dyn DiscoveryObserver>,
 }
 
-impl<'config> WalkPythonFilesState<'config> {
-    fn new(resolver: Resolver<'config>, configuration_cache: ConfigurationCache) -> Self {
+impl<'config, 'observer> WalkPythonFilesState<'config, 'observer> {
+    fn new(
+        resolver: Resolver<'config>,
+        configuration_cache: ConfigurationCache,
+        observer: Option<&'observer dyn DiscoveryObserver>,
+    ) -> Self {
         Self {
             is_hierarchical: resolver.is_hierarchical(),
             merged: std::sync::Mutex::new((Vec::new(), Ok(()))),
             resolver: RwLock::new(resolver),
             configuration_cache,
+            observer,
         }
     }
 
@@ -595,30 +638,32 @@ fn deduplicate_files(mut files: ResolvedFiles) -> ResolvedFiles {
     files
 }
 
-struct PythonFilesVisitorBuilder<'s, 'config> {
-    state: &'s WalkPythonFilesState<'config>,
+struct PythonFilesVisitorBuilder<'s, 'config, 'observer> {
+    state: &'s WalkPythonFilesState<'config, 'observer>,
     transformer: &'s (dyn ConfigurationTransformer + Sync),
 }
 
-impl<'s, 'config> PythonFilesVisitorBuilder<'s, 'config> {
+impl<'s, 'config, 'observer> PythonFilesVisitorBuilder<'s, 'config, 'observer> {
     fn new(
         transformer: &'s (dyn ConfigurationTransformer + Sync),
-        state: &'s WalkPythonFilesState<'config>,
+        state: &'s WalkPythonFilesState<'config, 'observer>,
     ) -> Self {
         Self { state, transformer }
     }
 }
 
-struct PythonFilesVisitor<'s, 'config> {
+struct PythonFilesVisitor<'s, 'config, 'observer> {
     local_files: Vec<Result<ResolvedFile, ignore::Error>>,
     local_error: Result<()>,
-    global: &'s WalkPythonFilesState<'config>,
+    global: &'s WalkPythonFilesState<'config, 'observer>,
     transformer: &'s (dyn ConfigurationTransformer + Sync),
 }
 
-impl<'config, 's> ignore::ParallelVisitorBuilder<'s> for PythonFilesVisitorBuilder<'s, 'config>
+impl<'config, 'observer, 's> ignore::ParallelVisitorBuilder<'s>
+    for PythonFilesVisitorBuilder<'s, 'config, 'observer>
 where
     'config: 's,
+    'observer: 's,
 {
     fn build(&mut self) -> Box<dyn ignore::ParallelVisitor + 's> {
         Box::new(PythonFilesVisitor {
@@ -630,7 +675,7 @@ where
     }
 }
 
-impl ParallelVisitor for PythonFilesVisitor<'_, '_> {
+impl ParallelVisitor for PythonFilesVisitor<'_, '_, '_> {
     fn visit(&mut self, result: std::result::Result<DirEntry, Error>) -> WalkState {
         // Respect our own exclusion behavior.
         if let Ok(entry) = &result {
@@ -663,6 +708,16 @@ impl ParallelVisitor for PythonFilesVisitor<'_, '_> {
             }
         }
 
+        // The walk lists a directory once its visitor continues: tell the observer first.
+        if let Some(observer) = self.global.observer
+            && let Ok(entry) = &result
+            && entry
+                .file_type()
+                .is_some_and(|file_type| file_type.is_dir())
+        {
+            observer.listing(entry.path());
+        }
+
         // Search for the `pyproject.toml` file in this directory, before we visit any
         // of its contents.
         if self.global.is_hierarchical {
@@ -671,12 +726,13 @@ impl ParallelVisitor for PythonFilesVisitor<'_, '_> {
                     .file_type()
                     .is_some_and(|file_type| file_type.is_dir())
                 {
-                    match settings_toml(entry.path()) {
+                    match settings_toml(entry.path(), self.global.observer) {
                         Ok(Some(pyproject)) => match resolve_scoped_settings(
                             &pyproject,
                             self.transformer,
                             ConfigurationOrigin::Ancestor,
                             Some(&self.global.configuration_cache),
+                            self.global.observer,
                         ) {
                             Ok(settings) => {
                                 self.global
@@ -737,7 +793,7 @@ impl ParallelVisitor for PythonFilesVisitor<'_, '_> {
     }
 }
 
-impl Drop for PythonFilesVisitor<'_, '_> {
+impl Drop for PythonFilesVisitor<'_, '_, '_> {
     fn drop(&mut self) {
         let mut merged = self.global.merged.lock().unwrap();
         let (files, error) = &mut *merged;
@@ -800,11 +856,12 @@ pub fn project_file_at_path(
     // Search for `pyproject.toml` files in all parent directories.
     if resolver.is_hierarchical() {
         for ancestor in path.ancestors() {
-            if let Some(pyproject) = settings_toml(ancestor)? {
+            if let Some(pyproject) = settings_toml(ancestor, None)? {
                 let settings = resolve_scoped_settings(
                     &pyproject,
                     transformer,
                     ConfigurationOrigin::Unknown,
+                    None,
                     None,
                 )?;
                 resolver.add(ancestor, settings);
@@ -1074,6 +1131,7 @@ mod tests {
                 resolved: ResolvedSettings::new(Configuration::default().into_settings(root)?),
             },
             &NoOpTransformer,
+            None,
         )?;
         let paths = paths
             .into_iter()

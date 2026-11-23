@@ -18,7 +18,8 @@
 //! - `check/<package>` and `format/<package>`: the results of each package's files, by path
 //!   relative to the package root;
 //! - `store`: every result by key, path and content, shared by all of them;
-//! - `builds`: the digests of the executables that ran.
+//! - `builds`: the digests of the executables that ran;
+//! - `walks/<run shape>`: what a search for project files found and read (see [`walk`]).
 
 use std::fs;
 use std::hash::{Hash, Hasher};
@@ -43,6 +44,8 @@ use ruff_linter::source_kind::{SourceError, SourceKind};
 use ruff_python_ast::SourceType;
 use ruff_workspace::Settings;
 use ruff_workspace::resolver::Resolver;
+
+pub(crate) mod walk;
 
 /// How long a file's result is kept when no run looks it up: runs given some of a package's
 /// files (as pre-commit hooks and editors do) keep the results of the others.

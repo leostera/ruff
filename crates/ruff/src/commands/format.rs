@@ -42,6 +42,7 @@ use ruff_workspace::resolver::{
 };
 
 use crate::args::{ConfigArguments, FormatArguments, FormatRange};
+use crate::cache::walk::WalkCache;
 use crate::cache::{CachedFile, Formatted, PackageCaches, SourceBytes};
 use crate::{ExitStatus, resolve_default_files};
 
@@ -77,7 +78,13 @@ pub(crate) fn format(
     let started = Timestamp::now();
     let mode = FormatMode::from_cli(&cli);
     let files = resolve_default_files(cli.files, false);
-    let (paths, resolver) = project_files_in_path(&files, root_settings, config_arguments)?;
+    let (paths, resolver) = match (!cli.no_cache)
+        .then(|| WalkCache::open(&files, root_settings, started))
+        .flatten()
+    {
+        Some(walk) => walk.project_files(&files, root_settings, config_arguments)?,
+        None => project_files_in_path(&files, root_settings, config_arguments, None)?,
+    };
 
     let output_format = root_settings.resolved.settings.output_format;
 

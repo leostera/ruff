@@ -67,7 +67,8 @@ fn ruff_check_paths<'a>(
     cli: &FormatArguments,
     config_arguments: &ConfigArguments,
 ) -> anyhow::Result<(Vec<Result<ResolvedFile, ignore::Error>>, Resolver<'a>)> {
-    let (paths, resolver) = project_files_in_path(&cli.files, root_settings, config_arguments)?;
+    let (paths, resolver) =
+        project_files_in_path(&cli.files, root_settings, config_arguments, None)?;
     Ok((paths, resolver))
 }
 
