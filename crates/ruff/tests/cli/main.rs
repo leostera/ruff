@@ -16,6 +16,7 @@ use std::{
 use tempfile::TempDir;
 
 mod analyze_graph;
+mod cache;
 mod format;
 mod lint;
 mod show_settings;
