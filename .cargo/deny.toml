@@ -15,6 +15,7 @@ external-default-features = "allow"
 allow-build-scripts = [
     "alloca",
     "anyhow",
+    "blake3",
     "camino",
     "codspeed",
     "codspeed-criterion-compat",

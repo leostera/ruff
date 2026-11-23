@@ -152,6 +152,8 @@ At the time of writing, the repository includes the following crates:
     `cargo dev generate-all`), see the [`cargo dev`](#cargo-dev) section below.
 - `crates/ruff_diagnostics`: library crate for the rule-independent abstractions in the lint
     diagnostics APIs.
+- `crates/ruff_file_cache`: library crate for keeping per-file results and what a run read
+    across runs, so that later runs only redo what changed.
 - `crates/ruff_formatter`: library crate for language agnostic code formatting logic based on an
     intermediate representation. The backend for `ruff_python_formatter`.
 - `crates/ruff_index`: library crate inspired by `rustc_index`.
